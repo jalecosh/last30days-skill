@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Iterator
 from datetime import datetime
 
 from . import http, normalize as normalizer, providers, schema, signals
@@ -764,17 +765,33 @@ def _build_fun_prompt(topic: str, candidates: list[schema.Candidate]) -> str:
     )
 
 
-def _extract_comment_text(candidate: schema.Candidate) -> str:
-    parts = []
+def _iter_comment_text_parts(candidate: schema.Candidate, *, include_scores: bool) -> Iterator[str]:
     for item in candidate.source_items:
         for comment in item.metadata.get("top_comments", [])[:3]:
-            body = comment.get("body", "") if isinstance(comment, dict) else str(comment)
-            if body:
-                parts.append(body[:150])
+            if isinstance(comment, dict):
+                body = comment.get("body", "")
+                if not body:
+                    continue
+                prefix = ""
+                if include_scores:
+                    score = comment.get("score")
+                    # Only prefix POSITIVE scores: `and score` is truthy for
+                    # negatives too, which would emit a misleading `[+-3]` and
+                    # invert the traction signal to the judge.
+                    if isinstance(score, (int, float)) and score > 0:
+                        prefix = f"[+{int(score)}] "
+                yield f"{prefix}{body[:150]}"
+            else:
+                body = str(comment)
+                if body:
+                    yield body[:150]
         for insight in item.metadata.get("comment_insights", [])[:2]:
             if insight:
-                parts.append(str(insight)[:150])
-    return " | ".join(parts) if parts else ""
+                yield str(insight)[:150]
+
+
+def _extract_comment_text(candidate: schema.Candidate) -> str:
+    return " | ".join(_iter_comment_text_parts(candidate, include_scores=False))
 
 
 def _extract_comment_text_scored(candidate: schema.Candidate) -> str:
@@ -783,27 +800,7 @@ def _extract_comment_text_scored(candidate: schema.Candidate) -> str:
 
     Comment insights carry no score and are appended unprefixed.
     """
-    parts = []
-    for item in candidate.source_items:
-        for comment in item.metadata.get("top_comments", [])[:3]:
-            if isinstance(comment, dict):
-                body = comment.get("body", "")
-                if not body:
-                    continue
-                score = comment.get("score")
-                # Only prefix POSITIVE scores: `and score` is truthy for
-                # negatives too, which would emit a misleading `[+-3]` and
-                # invert the traction signal to the judge.
-                prefix = f"[+{int(score)}] " if isinstance(score, (int, float)) and score > 0 else ""
-                parts.append(f"{prefix}{body[:150]}")
-            else:
-                body = str(comment)
-                if body:
-                    parts.append(body[:150])
-        for insight in item.metadata.get("comment_insights", [])[:2]:
-            if insight:
-                parts.append(str(insight)[:150])
-    return " | ".join(parts) if parts else ""
+    return " | ".join(_iter_comment_text_parts(candidate, include_scores=True))
 
 
 def _apply_fun_scores(candidates: list[schema.Candidate], payload: dict) -> None:
