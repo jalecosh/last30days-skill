@@ -3777,6 +3777,146 @@ def _merge_reddit_items(free: list[dict], sc: list[dict]) -> list[dict]:
     return merged
 
 
+def _retrieve_reddit_stream(
+    *,
+    topic: str,
+    subquery: schema.SubQuery,
+    config: dict[str, Any],
+    depth: str,
+    from_date: str,
+    to_date: str,
+    raw_topic: str,
+    subreddits: list[str] | None,
+) -> tuple[list[dict], dict]:
+    # Keep each plan angle distinct. Passing raw_topic here collapses a
+    # four-group Reddit plan into duplicate bare-topic searches before fusion.
+    reddit_query = subquery.search_query or raw_topic or topic
+    dedicated_subreddits = config.get("_dedicated_subreddits") or None
+    has_sc_key = bool(config.get("SCRAPECREATORS_API_KEY"))
+    sc_first = (
+        has_sc_key
+        and (config.get(env.REDDIT_BACKEND_PIN_VAR) or "").lower()
+        == "scrapecreators"
+    )
+    if sc_first:
+        # env.REDDIT_BACKEND_PIN_VAR=scrapecreators: SC primary, public fallback
+        primary_failure: Exception | None = None
+        try:
+            result = reddit.search_and_enrich(
+                reddit_query, from_date, to_date, depth=depth,
+                token=config.get("SCRAPECREATORS_API_KEY"),
+                subreddits=subreddits,
+            )
+            items = reddit.parse_reddit_response(result)
+            if items:
+                return items, {}
+            sys.stderr.write(
+                "[Reddit] ScrapeCreators primary returned no items, "
+                "using public fallback\n"
+            )
+        except Exception as exc:
+            primary_failure = exc
+            sys.stderr.write(
+                f"[Reddit] ScrapeCreators primary failed "
+                f"({type(exc).__name__}: {exc}), using public fallback\n"
+            )
+        public_failure: Exception | None = None
+        try:
+            public_results = reddit_public.search_reddit_public(
+                reddit_query, from_date, to_date, depth=depth,
+                subreddits=subreddits,
+            )
+            if public_results:
+                if primary_failure is not None:
+                    state = reddit.classify_run_failure(str(primary_failure))
+                    return public_results, _outcome_artifact(
+                        state,
+                        f"Reddit primary failed; public fallback returned "
+                        f"{len(public_results)} items: {primary_failure}",
+                    )
+                return public_results, {}
+            sys.stderr.write(
+                "[Reddit] Public fallback returned no items after "
+                "ScrapeCreators primary miss\n"
+            )
+        except Exception as exc:
+            public_failure = exc
+            sys.stderr.write(
+                f"[Reddit] Public fallback also failed "
+                f"({type(exc).__name__}: {exc})\n"
+            )
+        failure = public_failure or primary_failure
+        if failure is not None:
+            state = reddit.classify_run_failure(str(failure))
+            raise SourceRunError(
+                f"Reddit primary and fallback produced no results after failure: {failure}",
+                state,
+            )
+        return [], {}
+
+    # Default: public Reddit first (free). ScrapeCreators backfills when the
+    # free path is empty OR returns fewer than the configured thinness floor
+    # (env.REDDIT_SC_MIN_ITEMS_VAR, default 0 = empty-only — today's
+    # behavior, no extra credit spend unless the user opts in).
+    try:
+        min_items = int(config.get(env.REDDIT_SC_MIN_ITEMS_VAR) or 0)
+    except (TypeError, ValueError):
+        min_items = 0
+    public_results: list[dict] = []
+    public_failure: Exception | None = None
+    try:
+        public_results = reddit_public.search_reddit_public(
+            reddit_query, from_date, to_date, depth=depth,
+            subreddits=subreddits, dedicated_subreddits=dedicated_subreddits,
+        ) or []
+    except Exception as exc:
+        public_failure = exc
+        sys.stderr.write(
+            f"[Reddit] Public search failed ({type(exc).__name__}: {exc})"
+        )
+        if not has_sc_key:
+            sys.stderr.write("\n")
+            state = reddit.classify_run_failure(str(exc))
+            raise SourceRunError(f"Reddit public search failed: {exc}", state) from exc
+        sys.stderr.write(", using ScrapeCreators backup\n")
+    # Enough free results, or no key to backfill with -> done. max(min_items,
+    # 1) keeps the default (min_items=0) as empty-only AND treats exactly
+    # `min_items` results as acceptable (no backfill) for min_items > 0.
+    if len(public_results) >= max(min_items, 1) or not has_sc_key:
+        return public_results, {}
+    if public_results:
+        sys.stderr.write(
+            f"[Reddit] Free path returned {len(public_results)} "
+            f"(below the {min_items}-item floor); backfilling with ScrapeCreators\n"
+        )
+    try:
+        result = reddit.search_and_enrich(
+            reddit_query, from_date, to_date, depth=depth,
+            token=config.get("SCRAPECREATORS_API_KEY"),
+            subreddits=subreddits,
+        )
+        sc_items = reddit.parse_reddit_response(result)
+    except Exception as exc:
+        sys.stderr.write(
+            f"[Reddit] ScrapeCreators backup also failed "
+            f"({type(exc).__name__}: {exc})\n"
+        )
+        state = reddit.classify_run_failure(str(exc))
+        return public_results, _outcome_artifact(
+            state,
+            f"Reddit backup failed after {len(public_results)} public items: {exc}",
+        )
+    merged = _merge_reddit_items(public_results, sc_items)
+    if public_failure is not None:
+        state = reddit.classify_run_failure(str(public_failure))
+        return merged, _outcome_artifact(
+            state,
+            f"Reddit public search failed; backup returned {len(sc_items)} items: "
+            f"{public_failure}",
+        )
+    return merged, {}
+
+
 def _retrieve_stream(*args, **kwargs) -> tuple[list[dict], dict]:
     """Run one stream and retain HTTP failures swallowed by source adapters."""
     source = str(kwargs.get("source") or "")
@@ -3869,133 +4009,16 @@ def _retrieve_stream_impl(
             explicit=bool(config.get("_hiring_signals_mode")),
         )
     if source == "reddit":
-        # Keep each plan angle distinct. Passing raw_topic here collapses a
-        # four-group Reddit plan into duplicate bare-topic searches before fusion.
-        reddit_query = subquery.search_query or raw_topic or topic
-        dedicated_subreddits = config.get("_dedicated_subreddits") or None
-        has_sc_key = bool(config.get("SCRAPECREATORS_API_KEY"))
-        sc_first = (
-            has_sc_key
-            and (config.get(env.REDDIT_BACKEND_PIN_VAR) or "").lower()
-            == "scrapecreators"
+        return _retrieve_reddit_stream(
+            topic=topic,
+            subquery=subquery,
+            config=config,
+            depth=depth,
+            from_date=from_date,
+            to_date=to_date,
+            raw_topic=raw_topic,
+            subreddits=subreddits,
         )
-        if sc_first:
-            # env.REDDIT_BACKEND_PIN_VAR=scrapecreators: SC primary, public fallback
-            primary_failure: Exception | None = None
-            try:
-                result = reddit.search_and_enrich(
-                    reddit_query, from_date, to_date, depth=depth,
-                    token=config.get("SCRAPECREATORS_API_KEY"),
-                    subreddits=subreddits,
-                )
-                items = reddit.parse_reddit_response(result)
-                if items:
-                    return items, {}
-                sys.stderr.write(
-                    "[Reddit] ScrapeCreators primary returned no items, "
-                    "using public fallback\n"
-                )
-            except Exception as exc:
-                primary_failure = exc
-                sys.stderr.write(
-                    f"[Reddit] ScrapeCreators primary failed "
-                    f"({type(exc).__name__}: {exc}), using public fallback\n"
-                )
-            public_failure: Exception | None = None
-            try:
-                public_results = reddit_public.search_reddit_public(
-                    reddit_query, from_date, to_date, depth=depth,
-                    subreddits=subreddits,
-                )
-                if public_results:
-                    if primary_failure is not None:
-                        state = reddit.classify_run_failure(str(primary_failure))
-                        return public_results, _outcome_artifact(
-                            state,
-                            f"Reddit primary failed; public fallback returned "
-                            f"{len(public_results)} items: {primary_failure}",
-                        )
-                    return public_results, {}
-                sys.stderr.write(
-                    "[Reddit] Public fallback returned no items after "
-                    "ScrapeCreators primary miss\n"
-                )
-            except Exception as exc:
-                public_failure = exc
-                sys.stderr.write(
-                    f"[Reddit] Public fallback also failed "
-                    f"({type(exc).__name__}: {exc})\n"
-                )
-            failure = public_failure or primary_failure
-            if failure is not None:
-                state = reddit.classify_run_failure(str(failure))
-                raise SourceRunError(
-                    f"Reddit primary and fallback produced no results after failure: {failure}",
-                    state,
-                )
-            return [], {}
-
-        # Default: public Reddit first (free). ScrapeCreators backfills when the
-        # free path is empty OR returns fewer than the configured thinness floor
-        # (env.REDDIT_SC_MIN_ITEMS_VAR, default 0 = empty-only — today's
-        # behavior, no extra credit spend unless the user opts in).
-        try:
-            min_items = int(config.get(env.REDDIT_SC_MIN_ITEMS_VAR) or 0)
-        except (TypeError, ValueError):
-            min_items = 0
-        public_results: list[dict] = []
-        public_failure: Exception | None = None
-        try:
-            public_results = reddit_public.search_reddit_public(
-                reddit_query, from_date, to_date, depth=depth,
-                subreddits=subreddits, dedicated_subreddits=dedicated_subreddits,
-            ) or []
-        except Exception as exc:
-            public_failure = exc
-            sys.stderr.write(
-                f"[Reddit] Public search failed ({type(exc).__name__}: {exc})"
-            )
-            if not has_sc_key:
-                sys.stderr.write("\n")
-                state = reddit.classify_run_failure(str(exc))
-                raise SourceRunError(f"Reddit public search failed: {exc}", state) from exc
-            sys.stderr.write(", using ScrapeCreators backup\n")
-        # Enough free results, or no key to backfill with -> done. max(min_items,
-        # 1) keeps the default (min_items=0) as empty-only AND treats exactly
-        # `min_items` results as acceptable (no backfill) for min_items > 0.
-        if len(public_results) >= max(min_items, 1) or not has_sc_key:
-            return public_results, {}
-        if public_results:
-            sys.stderr.write(
-                f"[Reddit] Free path returned {len(public_results)} "
-                f"(below the {min_items}-item floor); backfilling with ScrapeCreators\n"
-            )
-        try:
-            result = reddit.search_and_enrich(
-                reddit_query, from_date, to_date, depth=depth,
-                token=config.get("SCRAPECREATORS_API_KEY"),
-                subreddits=subreddits,
-            )
-            sc_items = reddit.parse_reddit_response(result)
-        except Exception as exc:
-            sys.stderr.write(
-                f"[Reddit] ScrapeCreators backup also failed "
-                f"({type(exc).__name__}: {exc})\n"
-            )
-            state = reddit.classify_run_failure(str(exc))
-            return public_results, _outcome_artifact(
-                state,
-                f"Reddit backup failed after {len(public_results)} public items: {exc}",
-            )
-        merged = _merge_reddit_items(public_results, sc_items)
-        if public_failure is not None:
-            state = reddit.classify_run_failure(str(public_failure))
-            return merged, _outcome_artifact(
-                state,
-                f"Reddit public search failed; backup returned {len(sc_items)} items: "
-                f"{public_failure}",
-            )
-        return merged, {}
     if source == "x":
         # One X source, an ordered chain of interchangeable backends. Try the
         # primary; fall through to the next only if it returns nothing or errors.
@@ -4441,4 +4464,3 @@ def _mock_stream_results(source: str, subquery: schema.SubQuery) -> tuple[list[d
             "resultCount": 1,
         }
     return payloads.get(source, []), {}
-
