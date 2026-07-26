@@ -1,0 +1,52 @@
+[
+  {
+    "id": "oxa60e1",
+    "parent_id": "t3_1uvd8j1",
+    "author": "u/narayan77",
+    "body": "Root comment",
+    "ups": 132,
+    "created_utc": 1783953624,
+    "permalink": "/r/ValueInvesting/comments/1uvd8j1/comment/oxa60e1/",
+    "replies": {
+      "items": [
+        {
+          "id": "oxa71v6",
+          "parent_id": "t1_oxa60e1",
+          "author": "Ancient-Purpose99",
+          "body": "Dividend reply",
+          "score": 11,
+          "created_utc": 1783953903,
+          "permalink": "/r/ValueInvesting/comments/1uvd8j1/comment/oxa71v6/",
+          "replies": {
+            "items": []
+          }
+        },
+        {
+          "id": "oxanz23",
+          "parent_id": "t1_oxa60e1",
+          "author": "dopexile",
+          "body": "Buybacks reply",
+          "score": 70,
+          "created_utc": 1783958314,
+          "permalink": "/r/ValueInvesting/comments/1uvd8j1/comment/oxanz23/",
+          "replies": {
+            "items": [
+              {
+                "id": "oxblo42",
+                "parent_id": "t1_oxanz23",
+                "author": "Few_Economics_8176",
+                "body": "Nested reply",
+                "score": 15,
+                "created_utc": 1783966831,
+                "permalink": "/r/ValueInvesting/comments/1uvd8j1/comment/oxblo42/",
+                "replies": {
+                  "items": []
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+]

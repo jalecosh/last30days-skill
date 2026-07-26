@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from . import dates, relevance, schema
+from . import dates, normalize as normalizer, reddit_topic_eligibility, relevance, schema
 
 # Editorial signal-to-noise scores. Grounding (Google Search) is 1.0 baseline;
 # social platforms discounted for noise.
@@ -91,6 +91,62 @@ def log1p_safe(value: float | int | None) -> float:
     if numeric <= 0:
         return 0.0
     return math.log1p(numeric)
+
+
+
+REDDIT_RAW_ENGAGEMENT_REFERENCE = math.log1p(1_000)
+
+
+def reddit_has_interactions(post_score: float | int | None, comments: float | int | None) -> bool:
+    """True when a Reddit post has either a score or a comment."""
+    return float(post_score or 0) > 0 or float(comments or 0) > 0
+
+
+def reddit_bounded_engagement(value: float | int | None) -> float:
+    """Log-scale one raw Reddit interaction count into the 0-to-1 range."""
+    return min(1.0, log1p_safe(value) / REDDIT_RAW_ENGAGEMENT_REFERENCE)
+
+
+def reddit_rank_score(
+    relevance: float,
+    freshness_score: float,
+    normalized_comments: float,
+    normalized_post_score: float,
+) -> float:
+    """Four-signal Reddit rank: relevance 35%, freshness 25%, comments 25%, score 15%."""
+    return (
+        0.35 * max(0.0, min(1.0, relevance))
+        + 0.25 * max(0.0, min(1.0, freshness_score))
+        + 0.25 * max(0.0, min(1.0, normalized_comments))
+        + 0.15 * max(0.0, min(1.0, normalized_post_score))
+    )
+
+def apply_adobe_reddit_relevance(item: schema.SourceItem) -> None:
+    """Blend Adobe centrality and research value into the existing relevance slot.
+
+    The outer Reddit score remains 35% relevance, 25% freshness, 25% comments,
+    and 15% post score. This function changes only that first component after
+    the Adobe title/body eligibility gate has accepted an item.
+    """
+    if item.source != "reddit":
+        return
+    lexical_relevance = float(item.local_relevance or 0.0)
+    centrality, research_value, final_relevance = reddit_topic_eligibility.relevance_components(
+        item, lexical_relevance,
+    )
+    item.local_relevance = final_relevance
+    item.metadata.update({
+        "topic_centrality_score": centrality,
+        "research_value_score": research_value,
+        "final_relevance_score": final_relevance,
+    })
+    base_score = reddit_rank_score(
+        final_relevance,
+        float(item.freshness or 0) / 100.0,
+        float(item.metadata.get("reddit_normalized_comments") or 0.0),
+        float(item.metadata.get("reddit_normalized_post_score") or 0.0),
+    )
+    item.local_rank_score = base_score * normalizer.reddit_subreddit_quality_multiplier(item.container)
 
 
 def _top_comment_score(item: schema.SourceItem) -> float:
@@ -272,8 +328,22 @@ def annotate_stream(
 ) -> list[schema.SourceItem]:
     """Attach local scoring metadata and return items sorted by local_rank_score."""
     prepared_query = ranking_query if isinstance(ranking_query, relevance.PreparedQuery) else relevance.PreparedQuery(ranking_query)
+    # Hard gate for every production Reddit path, including ScrapeCreators backup.
+    items = [
+        item
+        for item in items
+        if item.source != "reddit"
+        or (
+            normalizer.reddit_subreddit_quality_multiplier(item.container) > 0.0
+            and reddit_has_interactions(
+                item.engagement.get("score"), item.engagement.get("num_comments")
+            )
+        )
+    ]
     engagement_scores = normalize([engagement_raw(item) for item in items])
-    for item, eng_score in zip(items, engagement_scores, strict=True):
+    reddit_comment_scores = [reddit_bounded_engagement(item.engagement.get("num_comments")) if item.source == "reddit" else 0.0 for item in items]
+    reddit_post_scores = [reddit_bounded_engagement(item.engagement.get("score")) if item.source == "reddit" else 0.0 for item in items]
+    for item, eng_score, comment_score, post_score in zip(items, engagement_scores, reddit_comment_scores, reddit_post_scores, strict=True):
         item.local_relevance = local_relevance(item, prepared_query)
         item.freshness = freshness(
             item,
@@ -283,11 +353,26 @@ def annotate_stream(
         )
         item.engagement_score = eng_score
         item.source_quality = source_quality(item.source)
-        item.local_rank_score = (
-            0.65 * item.local_relevance
-            + 0.25 * (item.freshness / 100.0)
-            + 0.10 * ((eng_score or 0) / 100.0)
-        )
+        if item.source == "reddit":
+            normalized_comments = comment_score
+            normalized_post_score = post_score
+            item.metadata["reddit_normalized_comments"] = normalized_comments
+            item.metadata["reddit_normalized_post_score"] = normalized_post_score
+            base_score = reddit_rank_score(
+                item.local_relevance,
+                item.freshness / 100.0,
+                normalized_comments,
+                normalized_post_score,
+            )
+            multiplier = normalizer.reddit_subreddit_quality_multiplier(item.container)
+            item.metadata["reddit_subreddit_quality_multiplier"] = multiplier
+            item.local_rank_score = base_score * multiplier
+        else:
+            item.local_rank_score = (
+                0.65 * item.local_relevance
+                + 0.25 * (item.freshness / 100.0)
+                + 0.10 * ((eng_score or 0) / 100.0)
+            )
     return sorted(items, key=lambda item: item.local_rank_score or 0, reverse=True)
 
 

@@ -7,7 +7,7 @@ import math
 import re
 from datetime import datetime
 
-from . import http, providers, schema, signals
+from . import http, normalize as normalizer, providers, schema, signals
 
 
 # Penalty applied when a candidate does not mention the primary entity
@@ -674,6 +674,20 @@ ENTITY_MISS_FINAL_PENALTY = 20.0
 
 
 def _final_score(candidate: schema.Candidate) -> float:
+    if candidate.source == "reddit" and schema.candidate_primary_item(candidate) is not None:
+        primary = schema.candidate_primary_item(candidate)
+        metadata = primary.metadata if primary and isinstance(primary.metadata, dict) else {}
+        # The LLM may judge topical relevance, but Reddit freshness and the two
+        # separate interaction signals remain deterministic: 35/25/25/15.
+        base_score = 100.0 * signals.reddit_rank_score(
+            (candidate.rerank_score or 0.0) / 100.0,
+            candidate.freshness / 100.0,
+            float(metadata.get("reddit_normalized_comments") or 0.0),
+            float(metadata.get("reddit_normalized_post_score") or 0.0),
+        )
+        # A modest community-quality modifier is applied after the immutable
+        # 35/25/25/15 Reddit components, never as a discovery whitelist.
+        return base_score * normalizer.reddit_subreddit_quality_multiplier(primary.container)
     normalized_rrf = _normalized_rrf(candidate.rrf_score)
     rerank_score = candidate.rerank_score or 0.0
     # Engagement bonus: high-engagement items (viral TikToks, popular YouTube videos)

@@ -132,7 +132,7 @@ class TestEnvConstantParity:
     def test_pipeline_source_has_no_raw_reddit_env_literals(self):
         # The declared constants live in env.py; pipeline.py must not restate
         # the raw LAST30DAYS_REDDIT_* strings (comments included — they drift too).
-        source = Path(pipeline.__file__).read_text()
+        source = Path(pipeline.__file__).read_text(encoding="utf-8")
         assert "LAST30DAYS_REDDIT_" not in source
 
     def test_backend_pin_constant_flips_gating_to_sc_primary(self):
@@ -150,3 +150,14 @@ class TestEnvConstantParity:
         items, pub, sc = self._run(cfg, [_item("a")], [_item("z")])
         sc.assert_called_once()
         assert _ids(items) == ["a", "z"]
+
+class TestScrapeCreatorsNormalization:
+    def test_sc_zero_interaction_post_is_filtered_before_fusion(self):
+        sc_post = {
+            "id": "R1", "title": "kanye", "url": "https://reddit.com/r/x/comments/1/t/",
+            "date": "2026-06-30", "subreddit": "x", "selftext": "",
+            "engagement": {"score": 0, "num_comments": 0}, "relevance": 0.8,
+        }
+        assert pipeline._normalize_score_dedupe(
+            "reddit", [sc_post], "2026-06-01", "2026-06-30", "balanced_recent", "kanye"
+        ) == []

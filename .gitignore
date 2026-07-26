@@ -49,3 +49,11 @@ docs/brainstorms/
 
 /work
 /print
+# Local Last30Days runtime artifacts
+.last30days-plans/
+output/
+# Local editor settings
+.vscode/
+# Python runtime cache
+__pycache__/
+*.py[cod]

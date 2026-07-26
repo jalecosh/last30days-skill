@@ -291,6 +291,8 @@ class TestSearchRedditPublicHighLevel:
                 "metadata": {},
             }
         posts = [_p("In range", "aaa", "2024-03-29"), _p("Out of range", "bbb", "2021-01-01")]
+        posts[0]["score"] = 1
+        posts[0]["engagement"]["score"] = 1
         with mock.patch("lib.reddit_keyless._discover", return_value=posts), \
              mock.patch("lib.reddit_keyless.reddit_shreddit.fetch_comments",
                         return_value={"top_comments": [], "comment_insights": [], "num_comments": None}):

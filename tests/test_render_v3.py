@@ -96,11 +96,10 @@ class RenderV3Tests(unittest.TestCase):
         self.assertIn("Top voices: example.com, r/LocalLLaMA", text)
         self.assertIn("Web: 1 item | domains: example.com", text)
         self.assertIn("Reddit: 1 item | 344pts, 119cmt | communities: r/LocalLLaMA", text)
-        self.assertIn("[reddit, grounding] Grounded result", text)
-        self.assertIn("[344pts, 119cmt]", text)
-        self.assertIn("Also on: Web", text)
-        self.assertIn("Comment (22 upvotes): This is the strongest user reaction.", text)
-        self.assertIn("Insight: Users corroborate the main claim.", text)
+        self.assertIn("## Grounded result\u3000\u3000r/LocalLLaMA", text)
+        self.assertIn("Reddit: 1 item | 344pts, 119cmt", text)
+        self.assertIn("sources: Web, Reddit", text)
+        self.assertIn("u/[deleted]\uff1aThis is the strongest user reaction.      22 \u8d5e", text)
         self.assertIn("## Source Coverage", text)
 
     def test_render_context_includes_top_clusters(self):
@@ -394,7 +393,7 @@ class RenderTopCommentsTests(unittest.TestCase):
         self.assertLess(blob.index("tiktok killer comment one"), blob.index("comment 2 text"))
 
     def test_reddit_5_comments_renders_top_3(self):
-        """Reddit candidate with 5 comments (scores 500, 200, 50, 8, 3) renders 3."""
+        """Reddit discussion preserves all available comments in tree order."""
         comments = [
             {"score": 500, "excerpt": "Comment with 500 upvotes", "author": "user1"},
             {"score": 200, "excerpt": "Comment with 200 upvotes", "author": "user2"},
@@ -405,24 +404,24 @@ class RenderTopCommentsTests(unittest.TestCase):
         report = self._make_report_with_comments(top_comments=comments)
         text = render.render_compact(report)
         # Reddit authors render with u/ prefix now.
-        self.assertIn("u/user1 (500 upvotes):", text)
-        self.assertIn("u/user2 (200 upvotes):", text)
-        self.assertIn("u/user3 (50 upvotes):", text)
-        self.assertNotIn("u/user4 (8 upvotes):", text)
-        self.assertNotIn("u/user5 (3 upvotes):", text)
+        self.assertIn("u/user1\uff1aComment with 500 upvotes      500 \u8d5e", text)
+        self.assertIn("u/user2\uff1aComment with 200 upvotes      200 \u8d5e", text)
+        self.assertIn("u/user3\uff1aComment with 50 upvotes      50 \u8d5e", text)
+        self.assertIn("u/user4\uff1aComment with 8 upvotes      8 \u8d5e", text)
+        self.assertIn("u/user5\uff1aComment with 3 upvotes      3 \u8d5e", text)
 
     def test_reddit_1_comment_renders_1(self):
         """Reddit candidate with 1 comment renders 1."""
         comments = [{"score": 100, "excerpt": "Single comment", "author": "user1"}]
         report = self._make_report_with_comments(top_comments=comments)
         text = render.render_compact(report)
-        self.assertIn("u/user1 (100 upvotes): Single comment", text)
+        self.assertIn("u/user1\uff1aSingle comment      100 \u8d5e", text)
 
     def test_reddit_0_comments_no_section(self):
-        """Reddit candidate with 0 comments renders no comment section."""
+        """Reddit candidate with no comments shows the required empty-state message."""
         report = self._make_report_with_comments(top_comments=[])
         text = render.render_compact(report)
-        self.assertNotIn("upvotes)", text)
+        self.assertIn("\u6682\u65e0\u53ef\u7528\u8bc4\u8bba", text)
 
     def test_non_reddit_no_comments(self):
         """Non-Reddit candidate doesn't render comments when metadata has none."""
@@ -432,7 +431,7 @@ class RenderTopCommentsTests(unittest.TestCase):
         self.assertIn("Test cluster", text)
 
     def test_all_comments_below_score_10_no_section(self):
-        """All comments below score 10 renders no comment section."""
+        """Reddit discussion retains low-score comments when available."""
         comments = [
             {"score": 9, "excerpt": "Low score 1", "author": "user1"},
             {"score": 5, "excerpt": "Low score 2", "author": "user2"},
@@ -440,7 +439,9 @@ class RenderTopCommentsTests(unittest.TestCase):
         ]
         report = self._make_report_with_comments(top_comments=comments)
         text = render.render_compact(report)
-        self.assertNotIn("upvotes)", text)
+        self.assertIn("u/user1\uff1aLow score 1      9 \u8d5e", text)
+        self.assertIn("u/user2\uff1aLow score 2      5 \u8d5e", text)
+        self.assertIn("u/user3\uff1aLow score 3      1 \u8d5e", text)
 
     def test_youtube_comments_use_likes_label_and_50_threshold(self):
         comments = [
@@ -461,7 +462,7 @@ class RenderTopCommentsTests(unittest.TestCase):
         self.assertIn('"below threshold" — @carol (10 likes)', text)
 
     def test_reddit_comment_without_author_falls_back_to_legacy_label(self):
-        """When author is missing or [deleted], render falls back to 'Comment (...)'."""
+        """Missing or deleted authors use the required deleted-user placeholder."""
         comments = [
             {"score": 500, "excerpt": "No author field", "author": ""},
             {"score": 200, "excerpt": "Deleted user", "author": "[deleted]"},
@@ -469,12 +470,12 @@ class RenderTopCommentsTests(unittest.TestCase):
         ]
         report = self._make_report_with_comments(top_comments=comments)
         text = render.render_compact(report)
-        # Legacy format preserved - no u/ prefix leaks with empty/deleted handles.
-        self.assertIn("Comment (500 upvotes): No author field", text)
-        self.assertIn("Comment (200 upvotes): Deleted user", text)
-        self.assertIn("Comment (50 upvotes): Removed user", text)
-        self.assertNotIn("u/ (", text)
-        self.assertNotIn("u/[deleted]", text)
+        # Reddit discussion format has one consistent deleted-user placeholder.
+        self.assertIn("u/[deleted]\uff1aNo author field      500 \u8d5e", text)
+        self.assertIn("u/[deleted]\uff1aDeleted user      200 \u8d5e", text)
+        self.assertIn("u/[deleted]\uff1aRemoved user      50 \u8d5e", text)
+        self.assertNotIn("u/ ", text)
+        self.assertIn("u/[deleted]", text)
         self.assertNotIn("u/[removed]", text)
 
     def test_tiktok_comments_render_with_at_handle(self):
@@ -605,11 +606,11 @@ class RenderBestTakesCompactTests(unittest.TestCase):
         self.assertIn("fun:75", text)
 
     def test_candidate_with_fun_score_85_shows_fun_tag(self):
-        """Candidate with fun_score=85 shows 'fun:85' in its detail line."""
+        """Reddit discussion headers do not repeat generic candidate score metadata."""
         candidates = [self._make_candidate("c1", fun_score=85)]
         report = self._make_report_with_candidates(candidates)
         text = render.render_compact(report)
-        self.assertIn("fun:85", text)
+        self.assertNotIn("fun:85", text)
 
     def test_candidate_with_fun_score_40_no_fun_tag(self):
         """Candidate with fun_score=40 does NOT show fun tag (below 50 threshold)."""

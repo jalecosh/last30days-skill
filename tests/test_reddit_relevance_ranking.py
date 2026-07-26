@@ -31,11 +31,10 @@ class TestRelevanceRankKey:
         floored = {"relevance": 0.3, "engagement": {"score": 0, "num_comments": 0}}
         assert reddit._relevance_rank_key(floored) > reddit._relevance_rank_key(huge)
 
-    def test_keyless_key_matches_keyed_semantics(self):
-        on_topic = {"relevance": 0.3, "engagement": {"score": 10, "num_comments": 5}}
-        off_topic = {"relevance": 0.0, "engagement": {"score": 99999, "num_comments": 4000}}
-        assert reddit_keyless._relevance_rank_key(on_topic) > reddit_keyless._relevance_rank_key(off_topic)
-
+    def test_keyless_key_uses_four_signal_policy(self):
+        strong = {"relevance": 0.9, "date": "2026-06-01", "engagement": {"score": 500, "num_comments": 500}}
+        weak = {"relevance": 0.2, "date": "2026-06-30", "engagement": {"score": 10, "num_comments": 10}}
+        assert reddit_keyless._relevance_rank_key(strong, "2026-06-30") > reddit_keyless._relevance_rank_key(weak, "2026-06-30")
 
 # --------------------------------------------------------------------------- #
 # Keyed path (reddit.search_reddit)
@@ -89,8 +88,8 @@ def _kpost(rid, rel, score, date="2026-05-20"):
 
 class TestKeylessRanking:
     def test_relevance_first_and_zero_overlap_dropped(self):
-        on_strong = _kpost("aaa", 0.5, 10)
-        on_weak = _kpost("bbb", 0.2, 5000)
+        on_strong = _kpost("aaa", 0.9, 10)
+        on_weak = _kpost("bbb", 0.2, 20)
         off_viral = _kpost("ccc", 0.0, 99999)
 
         with mock.patch.object(reddit_keyless, "_discover",
@@ -104,3 +103,23 @@ class TestKeylessRanking:
         assert "ccc" not in "".join(urls)
         assert out[0]["url"].endswith("/aaa/p/")
         assert len(out) == 2
+
+    def test_newer_moderate_discussion_beats_slightly_more_popular_old_post(self):
+        newer = _kpost("new", 0.6, 25, date="2026-06-30")
+        newer["engagement"]["num_comments"] = 50
+        older = _kpost("old", 0.6, 30, date="2026-06-01")
+        older["engagement"]["num_comments"] = 55
+        with mock.patch.object(reddit_keyless, "_discover", return_value=[older, newer]), \
+             mock.patch.object(reddit_keyless, "_enrich", side_effect=lambda posts, depth: posts):
+            out = reddit_keyless.search_and_enrich("some topic", "2026-06-01", "2026-06-30")
+        assert out[0]["url"].endswith("/new/p/")
+
+    def test_highly_relevant_old_post_can_beat_weak_new_post(self):
+        old = _kpost("old", 0.95, 500, date="2026-06-01")
+        old["engagement"]["num_comments"] = 500
+        new = _kpost("new", 0.2, 10, date="2026-06-30")
+        new["engagement"]["num_comments"] = 10
+        with mock.patch.object(reddit_keyless, "_discover", return_value=[new, old]), \
+             mock.patch.object(reddit_keyless, "_enrich", side_effect=lambda posts, depth: posts):
+            out = reddit_keyless.search_and_enrich("some topic", "2026-06-01", "2026-06-30")
+        assert out[0]["url"].endswith("/old/p/")

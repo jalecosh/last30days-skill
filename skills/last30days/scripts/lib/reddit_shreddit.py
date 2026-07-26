@@ -26,7 +26,7 @@ from . import reddit_enrich
 # Up to N posts enriched per run, by depth (mirrors reddit_public.ENRICH_LIMITS).
 ENRICH_LIMITS = {
     "quick": 3,
-    "default": 5,
+    "default": 8,
     "deep": 8,
 }
 

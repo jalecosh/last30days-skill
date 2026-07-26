@@ -433,5 +433,33 @@ class TestUrlNormalization(unittest.TestCase):
             _normalize_url("https://reddit.com/r/test"),
         )
 
+
+class RedditSubqueryAllowanceTests(unittest.TestCase):
+    def test_multi_angle_allowance_reaches_global_pool_without_final_slots(self):
+        plan = schema.QueryPlan(
+            intent="opinion", freshness_mode="balanced_recent", cluster_mode="debate",
+            raw_topic="Adobe",
+            subqueries=[
+                schema.SubQuery(label=label, search_query=label, ranking_query=label, sources=["reddit"])
+                for label in ("creative", "firefly", "subscription", "alternatives")
+            ],
+            source_weights={"reddit": 1.0},
+        )
+        streams = {}
+        for label in ("creative", "firefly", "subscription", "alternatives"):
+            streams[(label, "reddit")] = [
+                make_item(
+                    f"{label}-{index}", "reddit",
+                    f"https://reddit.com/r/test/comments/{label}{index}/",
+                    f"{label} {index}", 0.9,
+                )
+                for index in range(3)
+            ]
+        candidates = fusion.weighted_rrf(
+            streams, plan, pool_limit=12, subquery_candidate_allowance=2,
+        )
+        labels = {label for candidate in candidates for label in candidate.subquery_labels}
+        self.assertEqual(labels, {"creative", "firefly", "subscription", "alternatives"})
+
 if __name__ == "__main__":
     unittest.main()

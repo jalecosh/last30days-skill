@@ -26,6 +26,16 @@ from . import dates, health, http, log
 
 SCRAPECREATORS_BASE = "https://api.scrapecreators.com/v1/reddit"
 
+# Bounds for the stored discussion tree. These are deliberately independent
+# from DEPTH_CONFIG: depth controls how many *posts* receive enrichment, while
+# these bounds prevent any one post's comments from making a report enormous.
+MAX_COMMENT_TREE_ROOTS = 10
+MAX_COMMENT_TREE_REPLIES = 10
+MAX_COMMENT_TREE_DEPTH = 6
+MAX_COMMENT_TREE_NODES = 100
+MAX_COMMENT_BODY_LENGTH = 4000
+MAX_TOP_COMMENTS = 10
+
 # Reddit's highest-upvote content (relationship drama, AITA, viral news) often
 # has near-zero topic overlap. Engagement-only ranking floats it above on-topic
 # posts, especially on bare global searches where no subreddits were resolved
@@ -44,7 +54,7 @@ DEPTH_CONFIG = {
     "default": {
         "global_searches": 2,
         "subreddit_searches": 3,
-        "comment_enrichments": 5,
+        "comment_enrichments": 8,
         "timeframe": "month",
     },
     "deep": {
@@ -235,6 +245,112 @@ def _extract_date(post: Dict[str, Any]) -> Optional[str]:
     return _parse_date(
         post.get("created_utc") or post.get("created_at") or post.get("created_at_iso")
     )
+
+
+def _comment_author(value: Any) -> str:
+    """Normalize a Reddit author for display and relationship metadata."""
+    author = str(value or "").strip()
+    if not author or author.lower() in {"[deleted]", "[removed]"}:
+        return "[deleted]"
+    return author.removeprefix("u/")
+
+
+def _comment_score(comment: Dict[str, Any]) -> int:
+    """Read either ScrapeCreators vote field without treating zero as missing."""
+    value = _first_of(comment.get("ups"), comment.get("score"), default=0)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _comment_date_time(value: Any) -> Optional[str]:
+    """Format provider time in the project's UTC parsing convention."""
+    if value in (None, ""):
+        return None
+    parsed = dates.parse_date(str(value))
+    return parsed.strftime("%Y-%m-%d %H:%M") if parsed else None
+
+
+def _comment_url(comment: Dict[str, Any]) -> str:
+    url = str(comment.get("url") or "").strip()
+    if url:
+        return url
+    permalink = str(comment.get("permalink") or "").strip()
+    if not permalink:
+        return ""
+    return permalink if permalink.startswith("http") else f"https://reddit.com{permalink}"
+
+
+def _raw_comment_replies(comment: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return ScrapeCreators nested ``replies.items`` safely."""
+    replies = comment.get("replies")
+    if isinstance(replies, dict):
+        replies = replies.get("items")
+    if not isinstance(replies, list):
+        return []
+    return [reply for reply in replies if isinstance(reply, dict)]
+
+
+def _project_comment_tree(raw_comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Project ScrapeCreators comments to a bounded, relationship-preserving tree."""
+    node_count = 0
+
+    def build(raw: Dict[str, Any], *, depth: int, parent_id: str | None,
+              parent_author: str | None) -> Dict[str, Any] | None:
+        nonlocal node_count
+        if node_count >= MAX_COMMENT_TREE_NODES or depth > MAX_COMMENT_TREE_DEPTH:
+            return None
+        author = _comment_author(raw.get("author"))
+        comment_id = str(raw.get("id") or raw.get("name") or "").strip()
+        provider_parent_id = raw.get("parent_id")
+        resolved_parent_id = str(provider_parent_id).strip() if provider_parent_id else parent_id
+        body = str(raw.get("body") or "")[:MAX_COMMENT_BODY_LENGTH]
+        created_utc = raw.get("created_utc")
+        node_count += 1
+        node = {
+            "id": comment_id, "parent_id": resolved_parent_id,
+            "parent_author": parent_author, "author": author, "body": body,
+            "excerpt": body[:400], "score": _comment_score(raw),
+            "created_utc": created_utc,
+            "date": _comment_date_time(created_utc or raw.get("created_at_iso") or raw.get("created_at")),
+            "depth": depth, "url": _comment_url(raw), "replies": [],
+        }
+        if depth >= MAX_COMMENT_TREE_DEPTH:
+            return node
+        replies = sorted(_raw_comment_replies(raw), key=_comment_score, reverse=True)
+        for reply in replies[:MAX_COMMENT_TREE_REPLIES]:
+            child = build(reply, depth=depth + 1,
+                          parent_id=comment_id or resolved_parent_id,
+                          parent_author=author)
+            if child is not None:
+                node["replies"].append(child)
+        return node
+
+    roots = sorted((comment for comment in raw_comments if isinstance(comment, dict)),
+                   key=_comment_score, reverse=True)
+    tree: List[Dict[str, Any]] = []
+    for root in roots[:MAX_COMMENT_TREE_ROOTS]:
+        node = build(root, depth=0, parent_id=None, parent_author=None)
+        if node is not None:
+            tree.append(node)
+    return tree
+
+
+def _flatten_comment_tree(comment_tree: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return every stored tree node for flat comment consumers."""
+    flattened: List[Dict[str, Any]] = []
+
+    def visit(node: Dict[str, Any]) -> None:
+        flattened.append(node)
+        for reply in node.get("replies") or []:
+            if isinstance(reply, dict):
+                visit(reply)
+
+    for root in comment_tree:
+        if isinstance(root, dict):
+            visit(root)
+    return flattened
 
 
 def _normalize_reddit_id(raw_id: str) -> str:
@@ -632,6 +748,10 @@ def enrich_with_comments(
     # always get enriched even if their upvote score is low.
     ranked = sorted(items, key=_total_engagement, reverse=True)
     top_items = ranked[:max_comments]
+    for item in top_items:
+        # Pipeline-only recall instrumentation. Normalization deliberately does
+        # not expose this transport marker in reader-facing Markdown.
+        item["_comment_enrichment_attempted"] = True
     _log(f"Enriching comments for {len(top_items)} posts (by total engagement)")
 
     start = time.monotonic()
@@ -659,42 +779,39 @@ def enrich_with_comments(
             if not raw_comments:
                 continue
 
-            top_comments = []
+            comment_tree = _project_comment_tree(raw_comments)
+            flat_comments = _flatten_comment_tree(comment_tree)
+            ranked_comments = sorted(flat_comments, key=_comment_score, reverse=True)
+            top_comments = [
+                {
+                    "score": comment["score"],
+                    # Preserve the legacy calendar-only date in the flat shape.
+                    "date": _parse_date(comment.get("created_utc"))
+                    or _parse_date(comment.get("date")),
+                    "author": comment["author"],
+                    "excerpt": comment["excerpt"],
+                    "url": comment["url"],
+                }
+                for comment in ranked_comments[:MAX_TOP_COMMENTS]
+            ]
             insights = []
-
-            for ci, c in enumerate(raw_comments[:10]):
-                body = c.get("body", "")
-                if not body or body in ("[deleted]", "[removed]"):
-                    continue
-
-                score = c.get("ups") or c.get("score", 0)
-                author = c.get("author", "[deleted]")
-                permalink = c.get("permalink", "")
-                comment_url = f"https://reddit.com{permalink}" if permalink else ""
-
-                max_excerpt = 400 if ci == 0 else 300
-                top_comments.append({
-                    "score": score,
-                    "date": _parse_date(c.get("created_utc")),
-                    "author": author,
-                    "excerpt": body[:max_excerpt],
-                    "url": comment_url,
-                })
-
-                if len(body) >= 30 and author not in ("[deleted]", "[removed]", "AutoModerator"):
+            for comment in ranked_comments[:MAX_TOP_COMMENTS]:
+                body = comment["body"]
+                author = comment["author"]
+                if len(body) >= 30 and author not in ("[deleted]", "AutoModerator"):
                     insight = body[:150]
                     if len(body) > 150:
                         for i, char in enumerate(insight):
                             if char in '.!?' and i > 50:
-                                insight = insight[:i+1]
+                                insight = insight[:i + 1]
                                 break
                         else:
                             insight = insight.rstrip() + "..."
                     insights.append(insight)
 
-            top_comments.sort(key=lambda c: c.get("score", 0), reverse=True)
-            item["top_comments"] = top_comments[:10]
-            item["comment_insights"] = insights[:10]
+            item["comment_tree"] = comment_tree
+            item["top_comments"] = top_comments
+            item["comment_insights"] = insights[:MAX_TOP_COMMENTS]
             enriched_count += 1
 
         if not_done:

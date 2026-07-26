@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional
 from collections import Counter
 
 from . import http
-from . import reddit_rss, reddit_shreddit, reddit_listing, reddit_arctic
+from . import dates, reddit_rss, reddit_shreddit, reddit_listing, reddit_arctic, signals
 # Scores are backfilled from popular derived subreddits, so an engagement-first
 # final sort buries on-topic RSS hits under viral off-topic posts. A relevance
 # floor + relevance-first final ranking keeps the section on-topic. Thresholds
@@ -42,16 +42,11 @@ MAX_DERIVED_SUBS = 5  # subreddits derived from RSS results for score backfill
 DEDICATED_SORTS = ["top", "hot", "new"]
 
 
-def _relevance_rank_key(post: Dict[str, Any]) -> float:
-    """Rank by relevance first, with a bounded engagement bonus as tiebreaker.
-
-    Mirrors reddit.py: the log-scaled bonus (capped at 0.25) orders
-    similarly-relevant posts by discussion volume but is too small to lift an
-    off-topic post (relevance ~0) above an on-topic one.
-    """
+def _relevance_rank_key(post: Dict[str, Any], reference_date: str | None = None) -> float:
+    """Use the Reddit four-signal rank with bounded raw engagement inputs."""
     eng = post.get("engagement", {})
-    total = (eng.get("score", 0) or 0) + (eng.get("num_comments", 0) or 0)
-    return (post.get("relevance") or 0.0) + min(0.25, math.log10(total + 1) / 20.0)
+    freshness_score = dates.recency_score(post.get("date"), max_days=30, reference_date=reference_date) / 100.0
+    return signals.reddit_rank_score(post.get("relevance") or 0.0, freshness_score, signals.reddit_bounded_engagement(eng.get("num_comments")), signals.reddit_bounded_engagement(eng.get("score")))
 
 
 def _log(msg: str) -> None:
@@ -183,6 +178,9 @@ def _enrich(posts: List[Dict[str, Any]], depth: str) -> List[Dict[str, Any]]:
     limit = ENRICH_LIMITS.get(depth, ENRICH_LIMITS["default"])
     to_enrich = posts[:limit]
     rest = posts[limit:]
+    for post in to_enrich:
+        # Pipeline-only recall instrumentation; normalize.py drops this marker.
+        post["_comment_enrichment_attempted"] = True
     if not to_enrich:
         return posts
 
@@ -285,6 +283,9 @@ def search_and_enrich(
         p for p in posts
         if p.get("date") is None or (from_date <= p["date"] <= to_date)
     ]
+    # Empty interaction threads add no community signal. Keep the empty result
+    # if every thread fails this gate rather than restoring zero-signal noise.
+    posts = [p for p in posts if signals.reddit_has_interactions(p.get("engagement", {}).get("score"), p.get("engagement", {}).get("num_comments"))]
 
     # Relevance floor: strip zero-overlap posts (relevance exactly 0 = no
     # title/body token match at all) when anything relevant remains, so
@@ -303,16 +304,8 @@ def search_and_enrich(
     if len(posts) < before:
         _log(f"Relevance floor dropped {before - len(posts)} off-topic posts")
 
-    # Provisional score-first order so enrichment-slot selection has a stable
-    # within-tier order to preserve.
-    posts.sort(
-        key=lambda p: (
-            p.get("engagement", {}).get("score", 0) or 0,
-            p.get("relevance", 0) or 0,
-            p.get("date") or "",
-        ),
-        reverse=True,
-    )
+    # Use the same 35/25/25/15 policy before scarce comment-enrichment slots.
+    posts.sort(key=lambda p: _relevance_rank_key(p, reference_date=to_date), reverse=True)
 
     # Enrichment slot selection is relevance-aware: entity-matching posts
     # claim the scarce comment slots first (score order preserved within
@@ -322,7 +315,7 @@ def search_and_enrich(
     # Final display order ranks relevance-first with a bounded engagement bonus,
     # so an off-topic high-upvote post can't outrank an on-topic one in what the
     # user sees. Enrichment above may have backfilled real comment counts.
-    posts.sort(key=_relevance_rank_key, reverse=True)
+    posts.sort(key=lambda p: _relevance_rank_key(p, reference_date=to_date), reverse=True)
 
     for i, post in enumerate(posts):
         post["id"] = f"R{i + 1}"

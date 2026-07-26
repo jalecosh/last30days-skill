@@ -75,6 +75,7 @@ def _diversify_pool(
     fused: list[schema.Candidate],
     pool_limit: int,
     min_per_source: int = 2,
+    subquery_candidate_allowance: int = 0,
 ) -> list[schema.Candidate]:
     """Ensure at least *min_per_source* items per qualifying source survive truncation.
 
@@ -98,6 +99,27 @@ def _diversify_pool(
             remainder.append(c)
     pool = [c for per_source in reserved.values() for c in per_source]
     seen = {c.candidate_id for c in pool}
+    # A Reddit-only multi-angle plan can otherwise have its fused pool consumed
+    # by one broad query before reranking sees candidates from the other angles.
+    # This is only an input allowance, not a final-report reservation: the normal
+    # global reranker still decides every final position.
+    if subquery_candidate_allowance > 0:
+        per_subquery: dict[str, int] = {}
+        for candidate in fused:
+            if len(pool) >= pool_limit:
+                break
+            labels = candidate.subquery_labels
+            if not labels:
+                continue
+            qualifying = [
+                label for label in labels
+                if per_subquery.get(label, 0) < subquery_candidate_allowance
+            ]
+            if qualifying and candidate.candidate_id not in seen:
+                pool.append(candidate)
+                seen.add(candidate.candidate_id)
+                for label in qualifying:
+                    per_subquery[label] = per_subquery.get(label, 0) + 1
     for c in remainder:
         if len(pool) >= pool_limit:
             break
@@ -112,6 +134,7 @@ def weighted_rrf(
     plan: schema.QueryPlan,
     *,
     pool_limit: int,
+    subquery_candidate_allowance: int = 0,
 ) -> list[schema.Candidate]:
     """Fuse ranked lists into a single candidate pool."""
     subqueries = {subquery.label: subquery for subquery in plan.subqueries}
@@ -204,4 +227,8 @@ def weighted_rrf(
 
     fused = sorted(candidates.values(), key=_candidate_sort_key)
     fused = _apply_per_author_cap(fused)
-    return _diversify_pool(fused, pool_limit)
+    return _diversify_pool(
+        fused,
+        pool_limit,
+        subquery_candidate_allowance=subquery_candidate_allowance,
+    )

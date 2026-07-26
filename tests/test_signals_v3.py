@@ -212,13 +212,14 @@ class SignalsV3Tests(unittest.TestCase):
             body="Patch notes and gameplay discussion.",
             url="https://example.com/noisy",
             published_at="2026-03-15",
-            engagement={"score": 5000, "num_comments": 1200, "upvote_ratio": 0.95},
+            engagement={"score": 10, "num_comments": 5, "upvote_ratio": 0.95},
             metadata={"top_comments": [{"score": 400}]},
         )
         ranked = signals.annotate_stream(
             [noisy, relevant],
             ranking_query="How do I deploy on Fly.io?",
             freshness_mode="evergreen_ok",
+            reference_date="2026-03-15",
         )
         self.assertEqual("relevant", ranked[0].item_id)
 
@@ -812,6 +813,27 @@ class SignalsV3Tests(unittest.TestCase):
         self.assertNotIn("reddit-snippet", ids,
                          "Non-YouTube items should still be pruned by relevance threshold")
 
+
+    def test_reddit_comment_and_post_components_are_separate(self):
+        comments = schema.SourceItem(item_id="comments", source="reddit", title="topic", body="topic", url="https://example.com/comments", published_at="2026-06-30", engagement={"score": 10, "num_comments": 100})
+        score = schema.SourceItem(item_id="score", source="reddit", title="topic", body="topic", url="https://example.com/score", published_at="2026-06-30", engagement={"score": 100, "num_comments": 10})
+        ranked = signals.annotate_stream([comments, score], "topic", "balanced_recent", reference_date="2026-06-30")
+        by_id = {item.item_id: item for item in ranked}
+        assert by_id["comments"].metadata["reddit_normalized_comments"] > by_id["score"].metadata["reddit_normalized_comments"]
+        assert by_id["score"].metadata["reddit_normalized_post_score"] > by_id["comments"].metadata["reddit_normalized_post_score"]
+
+    def test_reddit_components_ignore_ratio_and_top_comment(self):
+        low = schema.SourceItem(item_id="low", source="reddit", title="topic", body="topic", url="https://example.com/low", published_at="2026-06-30", engagement={"score": 50, "num_comments": 20, "upvote_ratio": 0.1}, metadata={"top_comments": [{"score": 1}]})
+        high = schema.SourceItem(item_id="high", source="reddit", title="topic", body="topic", url="https://example.com/high", published_at="2026-06-30", engagement={"score": 50, "num_comments": 20, "upvote_ratio": 0.99}, metadata={"top_comments": [{"score": 9999}]})
+        ranked = signals.annotate_stream([low, high], "topic", "balanced_recent", reference_date="2026-06-30")
+        assert ranked[0].metadata["reddit_normalized_comments"] == ranked[1].metadata["reddit_normalized_comments"]
+        assert ranked[0].metadata["reddit_normalized_post_score"] == ranked[1].metadata["reddit_normalized_post_score"]
+
+    def test_non_reddit_local_rank_formula_is_unchanged(self):
+        item = schema.SourceItem(item_id="x", source="x", title="topic", body="topic", url="https://example.com/x", published_at="2026-06-30", engagement={"likes": 10})
+        ranked = signals.annotate_stream([item], "topic", "balanced_recent", reference_date="2026-06-30")[0]
+        expected = 0.65 * ranked.local_relevance + 0.25 * (ranked.freshness / 100.0) + 0.10 * ((ranked.engagement_score or 0) / 100.0)
+        assert ranked.local_rank_score == expected
 
 if __name__ == "__main__":
     unittest.main()

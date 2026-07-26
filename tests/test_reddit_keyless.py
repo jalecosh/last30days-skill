@@ -102,8 +102,10 @@ class TestSearchAndEnrich:
             assert reddit_keyless.search_and_enrich("t", "2026-05-01", "2026-05-31") == []
 
     def test_date_filter_keeps_in_range_and_unknown(self):
-        posts = [_post(1, date="2026-05-10"), _post(2, date="2020-01-01"),
-                 _post(3, date=None)]
+        posts = [_scored(1, 1), _scored(2, 1), _scored(3, 1)]
+        posts[0]["date"] = "2026-05-10"
+        posts[1]["date"] = "2020-01-01"
+        posts[2]["date"] = None
         with mock.patch.object(reddit_keyless, "_discover", return_value=posts), \
              self._patch_enrich_passthrough():
             out = reddit_keyless.search_and_enrich("t", "2026-05-01", "2026-05-31")
@@ -112,14 +114,14 @@ class TestSearchAndEnrich:
         assert "Post 2" not in titles
 
     def test_reindexes_ids(self):
-        posts = [_post(1), _post(2), _post(3)]
+        posts = [_scored(1, 1), _scored(2, 1), _scored(3, 1)]
         with mock.patch.object(reddit_keyless, "_discover", return_value=posts), \
              self._patch_enrich_passthrough():
             out = reddit_keyless.search_and_enrich("t", "2026-05-01", "2026-05-31")
         assert [p["id"] for p in out] == ["R1", "R2", "R3"]
 
     def test_enrichment_attaches_comments(self):
-        posts = [_post(1)]
+        posts = [_scored(1, 1)]
         enriched = {
             "top_comments": [{"score": 9, "date": "2026-05-19", "author": "a",
                               "excerpt": "great", "url": "https://reddit.com/x"}],
@@ -135,7 +137,7 @@ class TestSearchAndEnrich:
         assert out[0]["engagement"]["num_comments"] == 14
 
     def test_enrichment_failure_keeps_posts(self):
-        posts = [_post(i) for i in range(8)]
+        posts = [_scored(i, 1) for i in range(8)]
         with mock.patch.object(reddit_keyless, "_discover", return_value=posts), \
              mock.patch.object(reddit_keyless.reddit_shreddit, "fetch_comments",
                                side_effect=Exception("svc down")):
@@ -143,7 +145,7 @@ class TestSearchAndEnrich:
         assert len(out) == 8  # all posts retained despite enrichment failure
 
     def test_only_top_n_enriched_by_depth(self):
-        posts = [_post(i, rel=1.0 - i / 100) for i in range(10)]
+        posts = [_scored(i, 1) for i in range(10)]
         with mock.patch.object(reddit_keyless, "_discover", return_value=posts), \
              mock.patch.object(reddit_keyless.reddit_shreddit, "fetch_comments",
                                return_value={"top_comments": [], "comment_insights": [],
@@ -152,6 +154,17 @@ class TestSearchAndEnrich:
         # quick depth enriches only top 3 posts
         assert fc.call_count == reddit_keyless.ENRICH_LIMITS["quick"]
 
+    def test_zero_interaction_posts_are_removed_without_fallback(self):
+        active = _scored(1, 1)
+        zero = _post(2)
+        with mock.patch.object(reddit_keyless, "_discover", return_value=[zero, active]), \
+             self._patch_enrich_passthrough():
+            out = reddit_keyless.search_and_enrich("t", "2026-05-01", "2026-05-31")
+        assert [post["title"] for post in out] == ["Post 1"]
+
+    def test_all_zero_interaction_posts_return_empty(self):
+        with mock.patch.object(reddit_keyless, "_discover", return_value=[_post(1), _post(2)]):
+            assert reddit_keyless.search_and_enrich("t", "2026-05-01", "2026-05-31") == []
 
 class TestSlotPriority:
     """Enrichment slot selection prefers entity-matching posts (R1-R3)."""

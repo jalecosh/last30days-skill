@@ -51,6 +51,7 @@ from . import (
     query,
     reddit,
     reddit_listing,
+    reddit_topic_eligibility,
     reddit_public,
     relevance,
     rerank,
@@ -71,7 +72,7 @@ from . import (
     youtube_yt,
 )
 from .cluster import cluster_candidates
-from .fusion import weighted_rrf
+from .fusion import candidate_key, weighted_rrf
 
 DISCOVERY_SOURCES = ("reddit", "hackernews", "digg", "x")
 _DISCOVERY_GENERIC_DOMAIN_TERMS = {
@@ -83,6 +84,17 @@ DEPTH_SETTINGS = {
     "default": {"per_stream_limit": 12, "pool_limit": 40, "rerank_limit": 40},
     "deep": {"per_stream_limit": 20, "pool_limit": 60, "rerank_limit": 60},
 }
+
+# This is a ceiling, never a fill target. Non-Reddit sources are unaffected.
+MAX_FINAL_REDDIT_POSTS = 15
+
+# Reddit-only multi-angle runs need enough headroom for each query angle to
+# contribute before the normal global rerank. These are bounded recall limits,
+# not minimums or final-report reservations.
+REDDIT_PER_SUBQUERY_CANDIDATE_LIMIT = 20
+REDDIT_FUSION_POOL_LIMIT = 60
+REDDIT_RERANK_LIMIT = 60
+REDDIT_SUBQUERY_CANDIDATE_ALLOWANCE = 5
 
 SEARCH_ALIAS = {
     "hn": "hackernews",
@@ -97,6 +109,96 @@ SEARCH_ALIAS = {
 # identifier, so N streams are pure redundancy -- and each extra stream risks
 # its own WAF-cookie Chrome harvest.
 MAX_SOURCE_FETCHES: dict[str, int] = {"x": 2, "jobs": 1, "linkedin": 1, "stocktwits": 1, "trustpilot": 1}
+
+
+def _is_explicit_reddit_only_plan(
+    requested_sources: list[str] | None,
+    plan: schema.QueryPlan,
+) -> bool:
+    """Whether an explicit plan is bounded to Reddit and nothing else."""
+    if set(requested_sources or []) != {"reddit"}:
+        return False
+    return bool(plan.subqueries) and all(
+        {source.lower() for source in subquery.sources} == {"reddit"}
+        for subquery in plan.subqueries
+    )
+
+
+def _should_apply_adobe_reddit_topic_gate(
+    topic: str,
+    plan: schema.QueryPlan,
+) -> bool:
+    """Apply the content gate only to Adobe-focused Reddit research plans."""
+    if not any("reddit" in subquery.sources for subquery in plan.subqueries):
+        return False
+    return reddit_topic_eligibility.is_adobe_focused_text(topic) or any(
+        reddit_topic_eligibility.is_adobe_focused_text(subquery.search_query)
+        or reddit_topic_eligibility.is_adobe_focused_text(subquery.ranking_query)
+        for subquery in plan.subqueries
+    )
+
+
+def _reddit_recall_settings(
+    settings: dict[str, int],
+    config: dict[str, Any],
+    *,
+    reddit_only: bool,
+) -> dict[str, int]:
+    """Raise bounded Reddit-only recall limits without overriding CLI caps."""
+    if not reddit_only:
+        return settings
+    adjusted = dict(settings)
+    if config.get("_max_per_source") is None:
+        adjusted["per_stream_limit"] = max(
+            adjusted["per_stream_limit"], REDDIT_PER_SUBQUERY_CANDIDATE_LIMIT,
+        )
+    if config.get("_max_results") is None:
+        adjusted["pool_limit"] = max(adjusted["pool_limit"], REDDIT_FUSION_POOL_LIMIT)
+        adjusted["rerank_limit"] = max(adjusted["rerank_limit"], REDDIT_RERANK_LIMIT)
+    return adjusted
+
+
+def _reddit_has_usable_comments(item: dict[str, Any]) -> bool:
+    return bool(item.get("comment_tree") or item.get("top_comments"))
+
+
+def _reddit_raw_stats(items: list[dict[str, Any]]) -> dict[str, int]:
+    """Capture pre-normalization Reddit gates for debug artifacts only."""
+    blocked = 0
+    commentless = 0
+    usable_comments = 0
+    zero_interaction = 0
+    submitted_for_comment_enrichment = 0
+    for item in items:
+        if item.get("_comment_enrichment_attempted"):
+            submitted_for_comment_enrichment += 1
+        subreddit = item.get("subreddit")
+        if normalize._is_excluded_reddit_subreddit(subreddit):
+            blocked += 1
+            continue
+        if _reddit_has_usable_comments(item):
+            usable_comments += 1
+        else:
+            commentless += 1
+        engagement = item.get("engagement") or {}
+        try:
+            score = int(engagement.get("score", item.get("score", 0)) or 0)
+        except (TypeError, ValueError):
+            score = 0
+        try:
+            comments = int(engagement.get("num_comments", item.get("num_comments", 0)) or 0)
+        except (TypeError, ValueError):
+            comments = 0
+        if score == 0 and comments == 0:
+            zero_interaction += 1
+    return {
+        "raw_records": len(items),
+        "posts_submitted_for_comment_enrichment": submitted_for_comment_enrichment,
+        "posts_with_usable_comments": usable_comments,
+        "posts_removed_as_commentless": commentless,
+        "posts_removed_by_blocklist": blocked,
+        "posts_removed_as_zero_interaction": zero_interaction,
+    }
 
 
 def _resolve_depth_settings(depth: str, config: dict[str, Any]) -> dict[str, int]:
@@ -1956,7 +2058,11 @@ def run(
         available = [s for s in available if s != "grounding"]
     elif web_backend in ("brave", "exa", "serper", "parallel", "keyless") and "grounding" not in available:
         available.append("grounding")
-    if (hiring_signals_mode or _company_topic_likely(topic)) and "jobs" not in available:
+    if (
+        (hiring_signals_mode or _company_topic_likely(topic))
+        and "jobs" not in available
+        and (not requested_sources or "jobs" in requested_sources)
+    ):
         available.append("jobs")
     if hiring_signals_mode:
         config = dict(config)
@@ -2008,9 +2114,11 @@ def run(
         for sq in plan.subqueries:
             if "grounding" not in sq.sources:
                 sq.sources.append("grounding")
-    if "drill-mode" not in plan.notes:
+    if "drill-mode" not in plan.notes and (
+        not requested_sources or "jobs" in requested_sources
+    ):
         # Drill plans re-fetch only the sources that contributed to the matched
-        # cluster; the company-topic jobs injection must not widen that set.
+        # cluster; an explicit source boundary must not be widened with Jobs.
         _ensure_jobs_in_plan(plan, available, explicit=hiring_signals_mode, topic=topic)
     if "corpus" in available and plan.subqueries:
         # Corpus is deterministic and user-registered, so it always gets one
@@ -2043,7 +2151,12 @@ def run(
     else:
         print("[Planner]   (no subqueries in plan)", file=sys.stderr)
 
+    reddit_only_plan = _is_explicit_reddit_only_plan(requested_sources, plan)
+    adobe_reddit_topic_gate = _should_apply_adobe_reddit_topic_gate(topic, plan)
+    settings = _reddit_recall_settings(settings, config, reddit_only=reddit_only_plan)
+
     bundle = schema.RetrievalBundle(artifacts={"grounding": []})
+    bundle.artifacts["requested_sources"] = list(requested_sources or [])
     for source in (requested_sources or []):
         if source not in available:
             bundle.record_failure(
@@ -2177,6 +2290,21 @@ def run(
         }
 
     futures = {}
+    reddit_recall: dict[str, Any] = {
+        "raw_reddit_records_per_subquery": {},
+        "posts_submitted_for_comment_enrichment": 0,
+        "posts_with_usable_comments": 0,
+        "posts_removed_as_commentless": 0,
+        "posts_removed_by_blocklist": 0,
+        "posts_removed_as_zero_interaction": 0,
+        "topic_gate_applied": adobe_reddit_topic_gate,
+        "candidates_evaluated_by_topic_gate": 0,
+        "candidates_accepted_by_topic_gate": 0,
+        "candidates_rejected_by_topic_gate": 0,
+        "topic_gate_rejection_counts": {},
+        "accepted_count_per_subquery": {},
+        "accepted_count_per_subreddit": {},
+    }
     # Per-source fetch budget prevents redundant API calls
     source_fetch_count: dict[str, int] = {}
     stream_count = sum(
@@ -2278,6 +2406,12 @@ def run(
                     state, attempted = _classify_source_failure(exc)
                     bundle.record_failure(source, state, str(exc), attempted=attempted)
                     continue
+            if source == "reddit":
+                stats = _reddit_raw_stats(raw_items)
+                reddit_recall["raw_reddit_records_per_subquery"][subquery.label] = stats["raw_records"]
+                for key, value in stats.items():
+                    if key != "raw_records":
+                        reddit_recall[key] += value
             outcome_note = None
             if isinstance(artifact, dict) and artifact.get("_source_outcome"):
                 artifact = dict(artifact)
@@ -2293,6 +2427,65 @@ def run(
                 freshness_mode=plan.freshness_mode,
                 ranking_query=subquery.ranking_query,
             )
+            if source == "reddit" and adobe_reddit_topic_gate:
+                gate_results = [
+                    reddit_topic_eligibility.evaluate(
+                        item,
+                        subquery_label=subquery.label,
+                        search_query=subquery.search_query,
+                        ranking_query=subquery.ranking_query,
+                    )
+                    for item in normalized
+                ]
+                accepted = [
+                    item for item, result in zip(normalized, gate_results)
+                    if result.eligible
+                ]
+                rejected = [
+                    item for item, result in zip(normalized, gate_results)
+                    if not result.eligible
+                ]
+                reddit_recall["candidates_evaluated_by_topic_gate"] += len(gate_results)
+                reddit_recall["candidates_accepted_by_topic_gate"] += len(accepted)
+                reddit_recall["candidates_rejected_by_topic_gate"] += len(rejected)
+                for reason, count in reddit_topic_eligibility.rejection_counter(gate_results).items():
+                    counts = reddit_recall["topic_gate_rejection_counts"]
+                    counts[reason] = counts.get(reason, 0) + count
+                accepted_by_subquery = reddit_recall["accepted_count_per_subquery"]
+                accepted_by_subquery[subquery.label] = (
+                    accepted_by_subquery.get(subquery.label, 0) + len(accepted)
+                )
+                accepted_by_subreddit = reddit_recall["accepted_count_per_subreddit"]
+                for item in accepted:
+                    subreddit = normalize._normalized_subreddit_name(item.container) or "unknown"
+                    accepted_by_subreddit[subreddit] = accepted_by_subreddit.get(subreddit, 0) + 1
+                if rejected:
+                    bundle.artifacts.setdefault("reddit_topic_gate_rejections", []).extend([
+                        {
+                            "item_id": item.item_id,
+                            "url": item.url,
+                            "subreddit": item.container,
+                            "metadata": {
+                                key: item.metadata.get(key)
+                                for key in (
+                                    "topic_eligible", "topic_eligibility_score",
+                                    "topic_positive_signals", "topic_rejection_reasons",
+                                    "title_entity_match", "body_entity_match",
+                                    "relevant_comment_count", "usable_comment_count",
+                                    "title_evidence", "original_body_evidence",
+                                    "matched_subquery_support", "topic_centrality_score",
+                                    "research_value_score", "final_relevance_score",
+                                    "matched_subquery_label",
+                                )
+                            },
+                        }
+                        for item in rejected
+                    ])
+                # This is the existing relevance component, refined after
+                # title/body eligibility. It is not a third hard gate.
+                for item in accepted:
+                    signals.apply_adobe_reddit_relevance(item)
+                normalized = accepted
             # Jobs is exempt from per_stream_limit: a careers board is a complete
             # snapshot of open roles, and truncating it to the default 12 drops
             # strategic postings (the whole point of hiring-signals coverage).
@@ -2368,7 +2561,40 @@ def run(
         bundle.items_by_source, topic=topic, config=config, depth=depth, mock=mock,
     )
     source_status = _finalize_source_status(bundle.source_status, items_by_source)
-    candidates = weighted_rrf(bundle.items_by_source_and_query, plan, pool_limit=settings["pool_limit"])
+    reddit_stream_items = [
+        item
+        for (label, source), items in bundle.items_by_source_and_query.items()
+        if source == "reddit"
+        for item in items
+    ]
+    reddit_recall["unique_posts_after_deduplication"] = len(
+        {candidate_key(item) for item in reddit_stream_items}
+    )
+    reddit_recall["enriched_candidates_entering_fusion"] = len(reddit_stream_items)
+    candidates = weighted_rrf(
+        bundle.items_by_source_and_query,
+        plan,
+        pool_limit=settings["pool_limit"],
+        subquery_candidate_allowance=(
+            REDDIT_SUBQUERY_CANDIDATE_ALLOWANCE if reddit_only_plan else 0
+        ),
+    )
+    for candidate in candidates:
+        primary = schema.candidate_primary_item(candidate)
+        if primary is not None and primary.source == "reddit" and "topic_eligible" in primary.metadata:
+            candidate.metadata.update({
+                key: primary.metadata.get(key)
+                for key in (
+                    "topic_eligible", "topic_eligibility_score",
+                    "topic_positive_signals", "topic_rejection_reasons",
+                    "title_entity_match", "body_entity_match",
+                    "relevant_comment_count", "usable_comment_count",
+                    "title_evidence", "original_body_evidence",
+                    "matched_subquery_support", "topic_centrality_score",
+                    "research_value_score", "final_relevance_score",
+                    "matched_subquery_label",
+                )
+            })
     # Normalized set of handles this run resolved for the topic. A candidate
     # authored by one of these is first-party and is exempted from the
     # entity-miss demotion in rerank (a post never repeats its own author's
@@ -2431,6 +2657,17 @@ def run(
         provider=None,
         model=None,
     )
+    reddit_recall["final_ranked_reddit_posts_before_cap"] = sum(
+        1
+        for candidate in ranked_candidates
+        if (primary := schema.candidate_primary_item(candidate)) is not None
+        and primary.source == "reddit"
+    )
+    ranked_candidates, items_by_source = _cap_final_reddit_posts(
+        ranked_candidates, items_by_source,
+    )
+    reddit_recall["final_rendered_post_count"] = len(items_by_source.get("reddit", []))
+    bundle.artifacts["reddit_recall"] = reddit_recall
 
     # Phase 3: post-rerank GitHub star enrichment. Record/replay-aware so the
     # eval harness stays fully offline: this path calls the GitHub API (and the
@@ -2691,10 +2928,28 @@ def _normalize_score_dedupe(
     )
     if source != "jobs":
         normalized = signals.prune_low_relevance(normalized)
-    normalized = dedupe.dedupe_items(normalized)
+    normalized = (
+        _dedupe_reddit_items_by_canonical_identity(normalized)
+        if source == "reddit" else dedupe.dedupe_items(normalized)
+    )
     for item in normalized:
         item.snippet = snippet.extract_best_snippet(item, prepared_query)
     return normalized
+
+
+def _dedupe_reddit_items_by_canonical_identity(
+    items: list[schema.SourceItem],
+) -> list[schema.SourceItem]:
+    """Deduplicate Reddit only by canonical URL/post identity, never text similarity."""
+    kept: list[schema.SourceItem] = []
+    seen: set[str] = set()
+    for item in items:
+        key = candidate_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(item)
+    return kept
 
 
 def _finalize_items_by_source(
@@ -2707,7 +2962,10 @@ def _finalize_items_by_source(
     finalized = {}
     for source, items in items_by_source_raw.items():
         items = sorted(items, key=lambda item: item.local_rank_score or 0.0, reverse=True)
-        items = dedupe.dedupe_items(items)
+        items = (
+            _dedupe_reddit_items_by_canonical_identity(items)
+            if source == "reddit" else dedupe.dedupe_items(items)
+        )
         enrichment_request = {
             "source": source,
             "phase": "post_ranking_enrichment",
@@ -2758,6 +3016,55 @@ def _finalize_items_by_source(
                 http.fixture_source_record(enrichment_request, schema.to_dict(items))
         finalized[source] = items
     return finalized
+
+
+def _cap_final_reddit_posts(
+    ranked_candidates: list[schema.Candidate],
+    items_by_source: dict[str, list[schema.SourceItem]],
+) -> tuple[list[schema.Candidate], dict[str, list[schema.SourceItem]]]:
+    """Keep only the top ranked Reddit discussions in the final report.
+
+    Reddit quality gates run before this point. The cap only truncates that
+    ranked survivor set; it never reintroduces excluded or commentless posts to
+    make up a quota, and leaves every non-Reddit source untouched.
+    """
+    reddit_candidates = [
+        candidate
+        for candidate in ranked_candidates
+        if (primary := schema.candidate_primary_item(candidate)) is not None
+        and primary.source == "reddit"
+    ]
+    if len(reddit_candidates) <= MAX_FINAL_REDDIT_POSTS:
+        return ranked_candidates, items_by_source
+
+    kept_candidates = reddit_candidates[:MAX_FINAL_REDDIT_POSTS]
+    kept_candidate_ids = {candidate.candidate_id for candidate in kept_candidates}
+    kept_item_ids = {
+        primary.item_id
+        for candidate in kept_candidates
+        if (primary := schema.candidate_primary_item(candidate)) is not None
+    }
+    kept_urls = {
+        primary.url
+        for candidate in kept_candidates
+        if (primary := schema.candidate_primary_item(candidate)) is not None and primary.url
+    }
+    capped_candidates = [
+        candidate
+        for candidate in ranked_candidates
+        if not (
+            (primary := schema.candidate_primary_item(candidate)) is not None
+            and primary.source == "reddit"
+            and candidate.candidate_id not in kept_candidate_ids
+        )
+    ]
+    capped_items = dict(items_by_source)
+    capped_items["reddit"] = [
+        item
+        for item in items_by_source.get("reddit", [])
+        if item.item_id in kept_item_ids or (item.url and item.url in kept_urls)
+    ]
+    return capped_candidates, capped_items
 
 
 def _merge_replayed_enrichment(
@@ -3562,9 +3869,9 @@ def _retrieve_stream_impl(
             explicit=bool(config.get("_hiring_signals_mode")),
         )
     if source == "reddit":
-        # Use raw_topic so expand_reddit_queries() generates diverse variants
-        # from the original user topic, not the planner's narrowed search_query.
-        reddit_query = raw_topic or subquery.search_query
+        # Keep each plan angle distinct. Passing raw_topic here collapses a
+        # four-group Reddit plan into duplicate bare-topic searches before fusion.
+        reddit_query = subquery.search_query or raw_topic or topic
         dedicated_subreddits = config.get("_dedicated_subreddits") or None
         has_sc_key = bool(config.get("SCRAPECREATORS_API_KEY"))
         sc_first = (

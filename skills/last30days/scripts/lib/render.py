@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 from collections import Counter
 from datetime import date
 from urllib.parse import urlparse
@@ -338,19 +339,36 @@ def _render_ranked_clusters(
         candidate.candidate_id: candidate for candidate in report.ranked_candidates
     }
     for index, cluster in enumerate(clusters, start=1):
-        lines.append(
-            f"### {index}. {cluster.title} "
-            f"(score {cluster.score:.0f}, {len(cluster.candidate_ids)} "
-            f"item{'s' if len(cluster.candidate_ids) != 1 else ''}, "
-            f"sources: {', '.join(_source_label(source) for source in cluster.sources)})"
+        single_candidate = (
+            candidate_by_id.get(cluster.candidate_ids[0])
+            if len(cluster.candidate_ids) == 1 else None
         )
-        if cluster.uncertainty:
-            lines.append(f"- Uncertainty: {cluster.uncertainty}")
+        single_reddit = bool(
+            single_candidate
+            and schema.candidate_primary_item(single_candidate)
+            and schema.candidate_primary_item(single_candidate).source == "reddit"
+        )
+        if not single_reddit:
+            lines.append(
+                f"### {index}. {cluster.title} "
+                f"(score {cluster.score:.0f}, {len(cluster.candidate_ids)} "
+                f"item{'s' if len(cluster.candidate_ids) != 1 else ''}, "
+                f"sources: {', '.join(_source_label(source) for source in cluster.sources)})"
+            )
+            if cluster.uncertainty:
+                lines.append(f"- Uncertainty: {cluster.uncertainty}")
+        previous_was_reddit = False
         for rep_index, candidate_id in enumerate(cluster.representative_ids, start=1):
             candidate = candidate_by_id.get(candidate_id)
             if not candidate:
                 continue
+            primary = schema.candidate_primary_item(candidate)
+            is_reddit = bool(primary and primary.source == "reddit")
+            if previous_was_reddit and is_reddit:
+                # Reddit discussions use three blank lines as their post boundary.
+                lines.extend(["", "", ""])
             lines.extend(_render_candidate(candidate, prefix=f"{rep_index}.", report=report))
+            previous_was_reddit = is_reddit
         lines.append("")
     return lines
 
@@ -532,6 +550,8 @@ def render_compact(
     save_path: str | None = None,
     register: str = "default",
 ) -> str:
+    if _is_reddit_only_investmentbrain_report(report):
+        return render_investmentbrain_reddit_report(report)
     audience = registers.get_register(register)
     evidence_report = schema.without_sources(report, {"corpus"})
     non_empty = [s for s, items in sorted(report.items_by_source.items()) if items]
@@ -1318,8 +1338,68 @@ def render_comparison_multi_context(
     return "\n".join(lines).strip() + "\n"
 
 
+def _is_reddit_only_investmentbrain_report(report: schema.Report) -> bool:
+    """Return whether an explicitly Reddit-only run needs the reader-facing report."""
+    requested = report.artifacts.get("requested_sources")
+    if not isinstance(requested, (list, tuple, set)):
+        return False
+    normalized = {str(source).strip().lower() for source in requested if str(source).strip()}
+    return normalized == {"reddit"}
+
+
+def _render_investmentbrain_diagnostics(report: schema.Report) -> list[str]:
+    """Render operational diagnostics without translating engine-provided text."""
+    lines: list[str] = []
+    freshness = _assess_data_freshness(report)
+    if freshness:
+        lines.extend(["## Freshness", "", f"- {freshness}", ""])
+
+    warnings = [warning for warning in report.warnings if str(warning).strip()]
+    if warnings:
+        lines.extend(["## Warnings", ""])
+        lines.extend(f"- {warning}" for warning in warnings)
+        lines.append("")
+
+    partial_coverage = _render_source_outcome_note(report)
+    if partial_coverage:
+        lines.extend(partial_coverage)
+        lines.append("")
+
+    sources = set(report.items_by_source) | set(report.source_status) | set(report.errors_by_source)
+    if sources:
+        lines.extend(_render_source_coverage(report))
+    return lines
+
+
+# Search, ranking, filtering, and raw Markdown rendering preserve source language.
+# Reader-facing Chinese localization is a separate downstream transformation: it may
+# later change r/ValueInvesting, URL links, reply structure, and numeric scores, but
+# no such translation belongs in this production renderer.
+def render_investmentbrain_reddit_report(report: schema.Report) -> str:
+    """Render an explicitly Reddit-only report without model-control boilerplate."""
+    diagnostics = _render_investmentbrain_diagnostics(report)
+    lines = [
+        f"# {report.topic}",
+        "",
+        f"- {report.range_from} to {report.range_to}",
+        "- Reddit",
+        "",
+        *diagnostics,
+    ]
+    reddit_items = report.items_by_source.get("reddit", [])
+    if reddit_items:
+        if diagnostics:
+            # Exactly three empty Markdown lines separate diagnostics from posts.
+            lines.extend(["", "", ""])
+        lines.extend(_render_reddit_discussions(reddit_items))
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
 def render_full(report: schema.Report) -> str:
     """Full data dump: ALL clusters + ALL items by source. For saved files and debugging."""
+    if _is_reddit_only_investmentbrain_report(report):
+        return render_investmentbrain_reddit_report(report)
     evidence_report = schema.without_sources(report, {"corpus"})
     # Start with the same header as compact
     non_empty = [s for s, items in sorted(report.items_by_source.items()) if items]
@@ -1393,6 +1473,10 @@ def render_full(report: schema.Report) -> str:
             continue
         lines.append(f"### {_source_label(source)} ({len(items)} items)")
         lines.append("")
+        if source == "reddit":
+            lines.extend(_render_reddit_discussions(items))
+            lines.append("")
+            continue
         for item in items:
             score = item.local_rank_score if item.local_rank_score is not None else 0
             lines.append(f"**{item.item_id}** (score:{score:.0f}) {item.author or ''} ({item.published_at or 'date unknown'}) [{_format_item_engagement(item)}]")
@@ -1724,12 +1808,124 @@ def _render_hiring_signals(report: schema.Report) -> list[str]:
     return out
 
 
+def _markdown_text(value: object) -> str:
+    """Escape untrusted text for the small Markdown surfaces used below."""
+    text = str(value or "")
+    for character in ("\\", "`", "*", "_", "[", "]"):
+        text = text.replace(character, f"\\{character}")
+    return text.replace("\r", " ").replace("\n", " ").strip()
+
+
+def _markdown_url(value: object) -> str:
+    return str(value or "").strip().replace("\\", "%5C").replace(" ", "%20").replace(")", "%29")
+
+
+def _reddit_post_time(value: object) -> str:
+    """Return the source post date without a presentation-language label."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "unknown"
+    return raw[:10] if "T" in raw else raw
+
+
+def _reddit_source_text(value: object, fallback: str = "") -> str:
+    """Keep source text intact apart from line-break normalization for Markdown rows."""
+    text = str(value or fallback)
+    return text.replace("\r", " ").replace("\n", " ").strip()
+
+
+def _reddit_comment_author(value: object) -> str:
+    author = str(value or "").strip()
+    if not author or author.lower() in {"[deleted]", "[removed]"}:
+        return "[deleted]"
+    return author
+
+
+def _reddit_subreddit_label(value: object) -> str:
+    """Render a normalized raw subreddit reference without localizing its name."""
+    subreddit = str(value or "").strip()
+    if subreddit[:2].lower() == "r/":
+        subreddit = subreddit[2:].strip()
+    return "r/" + (subreddit or "unknown")
+
+
+def _reddit_comment_lines(
+    comment: dict,
+    depth: int = 0,
+    parent_author: str | None = None,
+) -> list[str]:
+    author = _reddit_comment_author(comment.get("author"))
+    body = _reddit_source_text(
+        comment.get("body") or comment.get("excerpt") or comment.get("text")
+    )
+    try:
+        score = int(comment.get("score") or 0)
+    except (TypeError, ValueError):
+        score = 0
+    score_suffix = "\u3000" * 3 + str(score)
+    if depth <= 0:
+        line = f"{author}\uff1a{body}{score_suffix}"
+    else:
+        direct_parent = _reddit_comment_author(comment.get("parent_author") or parent_author)
+        indent = "\u3000" * depth
+        line = f"{indent}\u21b3 {author} \u2192 {direct_parent}\uff1a{body}{score_suffix}"
+    lines = [line]
+    replies = comment.get("replies") or comment.get("children") or comment.get("comments") or []
+    if isinstance(replies, list):
+        for reply in replies:
+            if isinstance(reply, dict):
+                lines.extend(_reddit_comment_lines(reply, depth + 1, author))
+    return lines
+
+
+def _reddit_comment_tree(item: schema.SourceItem) -> list[str]:
+    comments = item.metadata.get("comment_tree") or item.metadata.get("comments") or item.metadata.get("top_comments") or []
+    if not isinstance(comments, list):
+        return []
+    lines: list[str] = []
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        try:
+            depth = max(0, int(comment.get("depth", comment.get("reply_depth", 0))))
+        except (TypeError, ValueError):
+            depth = 0
+        lines.extend(_reddit_comment_lines(comment, depth))
+    return lines
+
+
+def _render_reddit_discussion(item: schema.SourceItem) -> list[str]:
+    fields = [
+        _reddit_source_text(item.title, "unknown"),
+        _reddit_subreddit_label(item.container),
+        _reddit_post_time(item.published_at),
+    ]
+    url = _markdown_url(item.url)
+    if url:
+        fields.append(f"[URL]({url})")
+    lines = [f"## {'\u3000\u3000'.join(fields)}", ""]
+    # Reddit eligibility removes commentless posts before final rendering. Do not
+    # fabricate a language-specific placeholder if a malformed item slips through.
+    lines.extend(_reddit_comment_tree(item))
+    return lines
+
+
+def _render_reddit_discussions(items: list[schema.SourceItem]) -> list[str]:
+    lines: list[str] = []
+    for index, item in enumerate(items):
+        if index:
+            lines.extend(["", "", ""])
+        lines.extend(_render_reddit_discussion(item))
+    return lines
+
 def _render_candidate(
     candidate: schema.Candidate,
     prefix: str,
     report: schema.Report | None = None,
 ) -> list[str]:
     primary = schema.candidate_primary_item(candidate)
+    if primary and primary.source == "reddit":
+        return _render_reddit_discussion(primary)
     detail_parts = [
         _format_date(primary),
         _format_actor(primary),

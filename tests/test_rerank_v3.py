@@ -736,5 +736,18 @@ class InteractionSignalTests(unittest.TestCase):
         self.assertEqual(80.0, c.final_score)  # floor only lifts, never lowers
 
 
+    def test_reddit_final_score_uses_llm_only_for_relevance(self):
+        candidate = make_candidate(0.0)
+        candidate.source_items = [schema.SourceItem(item_id="i1", source="reddit", title="Title", body="Body", url="https://example.com", published_at="2026-06-30", metadata={"reddit_normalized_comments": 0.7, "reddit_normalized_post_score": 0.4})]
+        ranked = rerank.rerank_candidates(topic="topic", plan=make_plan(), candidates=[candidate], provider=FakeProvider({"scores": [{"candidate_id": candidate.candidate_id, "relevance": 80, "reason": "on topic"}]}), model="test", shortlist_size=1)
+        assert ranked[0].final_score == 100.0 * (0.35 * 0.8 + 0.25 * 0.8 + 0.25 * 0.7 + 0.15 * 0.4)
+
+    def test_non_reddit_final_score_remains_legacy_blend(self):
+        candidate = make_candidate(80.0)
+        candidate.source = "x"
+        candidate.engagement = 50
+        expected = 0.60 * candidate.rerank_score + 0.20 * rerank._normalized_rrf(candidate.rrf_score) + 0.10 * candidate.freshness + 0.05 * (candidate.source_quality * 100.0) + 0.05 * min(candidate.engagement * 6.0, 100.0)
+        assert rerank._final_score(candidate) == expected
+
 if __name__ == "__main__":
     unittest.main()

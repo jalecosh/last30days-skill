@@ -8,6 +8,50 @@ from urllib.parse import urlparse
 from . import dates, schema
 
 
+# This is intentionally a blocklist, not a discovery boundary. Reddit search remains
+# global; unknown communities retain normal eligibility unless explicitly blocked.
+BLOCKED_SUBREDDITS = {"fuckadobe"}
+# Backward-compatible private name for callers introduced before the policy was named.
+EXCLUDED_SUBREDDITS = BLOCKED_SUBREDDITS
+
+# Small post-base-score modifiers. They do not replace Reddit's 35/25/25/15
+# components and are applied only after that four-signal score is calculated.
+# Global boosts must be reusable across stock, company, and investment searches:
+# entity-, product-, profession-, and topic-specific communities (for example
+# r/Adobe) must not receive a global boost. Any such preference needs a separate
+# scoped subsystem keyed to the current entity or topic; none is implemented here.
+SUBREDDIT_QUALITY_MULTIPLIERS = {
+    "valueinvesting": 1.08,
+}
+DEFAULT_SUBREDDIT_QUALITY_MULTIPLIER = 1.00
+
+
+def _normalized_subreddit_name(value: object) -> str:
+    """Return a subreddit name suitable for case-insensitive policy checks."""
+    subreddit = str(value or "").strip()
+    if subreddit[:2].lower() == "r/":
+        subreddit = subreddit[2:].strip()
+    return subreddit.lower()
+
+
+def _is_excluded_reddit_subreddit(value: object) -> bool:
+    return _normalized_subreddit_name(value) in BLOCKED_SUBREDDITS
+
+
+def reddit_subreddit_quality_multiplier(value: object) -> float:
+    """Return the secondary ranking multiplier for a subreddit.
+
+    Unknown communities deliberately receive the default 1.00 instead of being
+    filtered or penalized, preserving topic-led global discovery.
+    """
+    normalized = _normalized_subreddit_name(value)
+    if normalized in BLOCKED_SUBREDDITS:
+        return 0.0
+    return SUBREDDIT_QUALITY_MULTIPLIERS.get(
+        normalized, DEFAULT_SUBREDDIT_QUALITY_MULTIPLIER
+    )
+
+
 def filter_by_date_range(
     items: list[schema.SourceItem],
     from_date: str,
@@ -66,6 +110,19 @@ def normalize_source_items(
     if normalizer is None:
         raise ValueError(f"Unsupported source: {source}")
     normalized = [normalizer(source, item, index, from_date, to_date) for index, item in enumerate(items)]
+    if source == "reddit":
+        # Hard exclusions apply before fusion/ranking and are never restored as
+        # a fallback. They accept either ``subreddit`` or ``r/subreddit``.
+        normalized = [
+            item for item in normalized
+            if not _is_excluded_reddit_subreddit(item.container)
+        ]
+        # Comment enrichment is the evidence for Reddit discussions. Do not let
+        # an un-enriched or commentless post reach fusion/the final report.
+        normalized = [
+            item for item in normalized
+            if item.metadata.get("comment_tree") or item.metadata.get("top_comments")
+        ]
     if source == "jobs":
         # A careers board is a snapshot of CURRENTLY OPEN roles. An open posting
         # is current evidence regardless of when it was posted, so date-windowing
@@ -284,7 +341,11 @@ def _normalize_reddit(
         why_relevant=str(item.get("why_relevant") or ""),
         snippet=comment_text or str(item.get("selftext") or "")[:400],
         metadata={
+            "comment_tree": item.get("comment_tree") or [],
             "top_comments": top_comments,
+            # Preserve the raw post body separately from comment excerpts so
+            # topic eligibility can distinguish post centrality from a side comment.
+            "reddit_post_body": str(item.get("selftext") or item.get("body") or item.get("description") or ""),
             "comment_insights": item.get("comment_insights") or [],
         },
     )
