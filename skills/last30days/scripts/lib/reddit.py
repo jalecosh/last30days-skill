@@ -8,8 +8,6 @@ API docs: https://scrapecreators.com/docs
 """
 
 import math
-import re
-import sys
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait as futures_wait

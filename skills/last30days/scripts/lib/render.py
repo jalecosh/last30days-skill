@@ -834,18 +834,6 @@ def _render_html_data_quality_note(report: schema.Report) -> str | None:
     return f"> **Data quality note:** {' '.join(_dedupe_notes(notes))}"
 
 
-def _render_html_comparison_data_quality_note(
-    entity_reports: list[tuple[str, schema.Report]],
-) -> str | None:
-    notes: list[str] = []
-    for label, report in entity_reports:
-        note = _render_html_data_quality_note(report)
-        if note:
-            clean = note.removeprefix("> **Data quality note:** ").strip()
-            notes.append(f"{label}: {clean}")
-    if not notes:
-        return None
-    return f"> **Data quality note:** {' '.join(_dedupe_notes(notes))}"
 
 
 def _dedupe_notes(notes: list[str]) -> list[str]:
@@ -1967,15 +1955,6 @@ def _render_candidate(
     return lines
 
 
-def _format_volume_short(volume: float) -> str:
-    """Format volume as short string: 66000 -> '$66K', 1200000 -> '$1.2M'."""
-    if volume >= 1_000_000:
-        return f"${volume / 1_000_000:.1f}M"
-    if volume >= 1_000:
-        return f"${volume / 1_000:.0f}K"
-    if volume >= 1:
-        return f"${volume:.0f}"
-    return ""
 
 
 def _shorten_polymarket_title(title: str) -> str:
