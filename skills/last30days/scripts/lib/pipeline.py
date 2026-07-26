@@ -2467,16 +2467,7 @@ def run(
                             "subreddit": item.container,
                             "metadata": {
                                 key: item.metadata.get(key)
-                                for key in (
-                                    "topic_eligible", "topic_eligibility_score",
-                                    "topic_positive_signals", "topic_rejection_reasons",
-                                    "title_entity_match", "body_entity_match",
-                                    "relevant_comment_count", "usable_comment_count",
-                                    "title_evidence", "original_body_evidence",
-                                    "matched_subquery_support", "topic_centrality_score",
-                                    "research_value_score", "final_relevance_score",
-                                    "matched_subquery_label",
-                                )
+                                for key in reddit_topic_eligibility.ADOBE_ELIGIBILITY_METADATA_KEYS
                             },
                         }
                         for item in rejected
@@ -2584,16 +2575,7 @@ def run(
         if primary is not None and primary.source == "reddit" and "topic_eligible" in primary.metadata:
             candidate.metadata.update({
                 key: primary.metadata.get(key)
-                for key in (
-                    "topic_eligible", "topic_eligibility_score",
-                    "topic_positive_signals", "topic_rejection_reasons",
-                    "title_entity_match", "body_entity_match",
-                    "relevant_comment_count", "usable_comment_count",
-                    "title_evidence", "original_body_evidence",
-                    "matched_subquery_support", "topic_centrality_score",
-                    "research_value_score", "final_relevance_score",
-                    "matched_subquery_label",
-                )
+                for key in reddit_topic_eligibility.ADOBE_ELIGIBILITY_METADATA_KEYS
             })
     # Normalized set of handles this run resolved for the topic. A candidate
     # authored by one of these is first-party and is exempted from the

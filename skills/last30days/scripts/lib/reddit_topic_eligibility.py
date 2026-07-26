@@ -14,6 +14,16 @@ from typing import Any
 from . import schema
 
 ELIGIBILITY_THRESHOLD = 7.0
+ADOBE_ELIGIBILITY_METADATA_KEYS = (
+    "topic_eligible", "topic_eligibility_score",
+    "topic_positive_signals", "topic_rejection_reasons",
+    "title_entity_match", "body_entity_match",
+    "relevant_comment_count", "usable_comment_count",
+    "title_evidence", "original_body_evidence",
+    "matched_subquery_support", "topic_centrality_score",
+    "research_value_score", "final_relevance_score",
+    "matched_subquery_label",
+)
 
 _DIRECT_PATTERNS: dict[str, re.Pattern[str]] = {
     "adobe": re.compile(r"\badobe\b", re.I),
