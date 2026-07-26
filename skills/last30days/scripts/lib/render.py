@@ -1808,14 +1808,6 @@ def _render_hiring_signals(report: schema.Report) -> list[str]:
     return out
 
 
-def _markdown_text(value: object) -> str:
-    """Escape untrusted text for the small Markdown surfaces used below."""
-    text = str(value or "")
-    for character in ("\\", "`", "*", "_", "[", "]"):
-        text = text.replace(character, f"\\{character}")
-    return text.replace("\r", " ").replace("\n", " ").strip()
-
-
 def _markdown_url(value: object) -> str:
     return str(value or "").strip().replace("\\", "%5C").replace(" ", "%20").replace(")", "%29")
 

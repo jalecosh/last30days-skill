@@ -17,7 +17,6 @@ ScrapeCreators backup when every keyless lane comes up empty.
 """
 
 import concurrent.futures
-import math
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional

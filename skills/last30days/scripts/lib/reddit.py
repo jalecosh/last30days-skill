@@ -13,7 +13,7 @@ import sys
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait as futures_wait
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 def _first_of(*values, default=None):
     """Return first value that is not None."""

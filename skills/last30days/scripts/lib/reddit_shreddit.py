@@ -16,7 +16,6 @@ cannot be recovered keylessly here (ScrapeCreators backup still provides it).
 
 import html as _html
 import re
-import sys
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -43,11 +42,6 @@ _PARA = re.compile(r"<p[^>]*>(.*?)</p>", re.S)
 _TAG = re.compile(r"<[^>]+>")
 _WS = re.compile(r"\s+")
 _NEXT_RTJSON = re.compile(r'id="t1_[A-Za-z0-9]+-(?:comment|post)-rtjson-content"')
-
-
-def _log(msg: str) -> None:
-    sys.stderr.write(f"[RedditShreddit] {msg}\n")
-    sys.stderr.flush()
 
 
 def extract_post_ref(url: str) -> Optional[tuple]:
