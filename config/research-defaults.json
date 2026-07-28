@@ -1,0 +1,16 @@
+{
+  "default_days": 30,
+  "sources": ["reddit"],
+  "intent": "opinion",
+  "freshness_mode": "strict_recent",
+  "cluster_mode": "story",
+  "output_directory": "output/results",
+  "reddit_backend": "scrapecreators",
+  "reddit_execution": {
+    "max_queries_per_group": 6,
+    "max_queries_per_company": 30,
+    "max_comment_trees_per_company": 24,
+    "max_discovered_subreddits_per_group": 3,
+    "max_subreddit_expansion_requests_per_group": 3
+  }
+}

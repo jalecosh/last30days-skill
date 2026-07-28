@@ -445,7 +445,17 @@ def _sanitize_plan(
     source_weights = _normalize_weights(source_weights)
 
     subqueries: list[schema.SubQuery] = []
-    for index, subquery in enumerate((raw.get("subqueries") or [])[:_max_subqueries(intent_hint, topic)], start=1):
+    raw_subqueries = raw.get("subqueries") or []
+    preserve_all = (
+        raw.get("preserve_all_subqueries") is True
+        and raw.get("reddit_search_execution_mode") == "group_scoped_subreddit_expansion"
+        and raw.get("reddit_comment_enrichment_mode") == "deferred_company_wide"
+        and 0 < len(raw_subqueries) <= int(raw.get("company_query_budget") or 0)
+        and all(isinstance(entry, dict) and entry.get("group_id") and "reddit" in (entry.get("sources") or []) for entry in raw_subqueries)
+    )
+    if not preserve_all:
+        raw_subqueries = raw_subqueries[:_max_subqueries(intent_hint, topic)]
+    for index, subquery in enumerate(raw_subqueries, start=1):
         if not isinstance(subquery, dict):
             continue
         sources = [source for source in subquery.get("sources") or [] if source in source_weights]
@@ -464,6 +474,7 @@ def _sanitize_plan(
                 ranking_query=ranking_query,
                 sources=sources,
                 weight=max(0.05, float(subquery.get("weight") or 1.0)),
+                group_id=(str(subquery.get("group_id")).strip() or None) if subquery.get("group_id") is not None else None,
             )
         )
     if depth == "quick" and subqueries:
@@ -485,15 +496,33 @@ def _sanitize_plan(
         cluster_mode=cluster_mode,
         raw_topic=topic,
         subqueries=_normalize_subquery_weights(
-            _trim_subqueries_for_depth(
-                subqueries,
-                intent,
-                depth,
-                eligible_sources,
-                requested_sources=requested_sources,
+            subqueries if preserve_all else _trim_subqueries_for_depth(
+                subqueries, intent, depth, eligible_sources, requested_sources=requested_sources,
             )
         ),
         source_weights=source_weights,
+        reddit_comment_enrichment_mode=(
+            "deferred_company_wide"
+            if raw.get("reddit_comment_enrichment_mode") == "deferred_company_wide"
+            else "immediate"
+        ),
+        reddit_comment_tree_budget=(
+            int(raw.get("reddit_comment_tree_budget"))
+            if isinstance(raw.get("reddit_comment_tree_budget"), int) and raw.get("reddit_comment_tree_budget") > 0
+            else 24
+        ),
+        reddit_search_execution_mode=(
+            "group_scoped_subreddit_expansion"
+            if raw.get("reddit_search_execution_mode") == "group_scoped_subreddit_expansion"
+            else "legacy_query_scoped"
+        ),
+        reddit_max_discovered_subreddits_per_group=max(1, int(raw.get("reddit_max_discovered_subreddits_per_group") or 3)),
+        reddit_max_subreddit_expansion_requests_per_group=max(1, int(raw.get("reddit_max_subreddit_expansion_requests_per_group") or 3)),
+        reddit_entity_terms=[
+            str(item).strip()
+            for item in raw.get("reddit_entity_terms") or []
+            if isinstance(item, str) and str(item).strip()
+        ],
         notes=[str(note).strip() for note in raw.get("notes") or [] if str(note).strip()],
     )
 
@@ -507,6 +536,7 @@ def _normalize_subquery_weights(subqueries: list[schema.SubQuery]) -> list[schem
             ranking_query=subquery.ranking_query,
             sources=subquery.sources,
             weight=subquery.weight / total,
+            group_id=subquery.group_id,
         )
         for subquery in subqueries
     ]
@@ -539,6 +569,7 @@ def _trim_subqueries_for_depth(
                 ranking_query=subquery.ranking_query,
                 sources=expanded_sources,
                 weight=subquery.weight,
+                group_id=subquery.group_id,
             )
             for subquery in subqueries
         ]

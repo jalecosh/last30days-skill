@@ -595,6 +595,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include matching corpus files older than the research window",
     )
     parser.add_argument("--output", help="Optional exact file path for saving the rendered output")
+    parser.add_argument("--run-summary-output", help="Write stable structured execution statistics JSON to this path")
     parser.add_argument("--synthesis-file", help="Markdown synthesis to embed in --emit=html output")
     parser.add_argument("--publish-html", action="store_true",
                         help="Publish --emit=html output to ht-ml.app (explicit opt-in; public by default)")
@@ -2060,6 +2061,8 @@ def _render_save_and_print(
     synthesis_md: str | None,
     config: dict[str, object],
 ) -> int:
+    if args.run_summary_output:
+        _write_run_summary(report, args.run_summary_output)
     fun_level = str(config.get("FUN_LEVEL", "medium")).lower()
     try:
         audience = _audience_register_for_run(args, config, entity_reports)
@@ -2206,6 +2209,51 @@ def _render_save_and_print(
             sys.stderr.flush()
     print(rendered)
     return _strict_exit_code(report, entity_reports, config)
+
+
+def build_run_summary(report: schema.Report) -> dict[str, object]:
+    """Return presentation-independent statistics from the final Report object."""
+    statistics = report.artifacts.get("run_statistics")
+    if not isinstance(statistics, dict):
+        statistics = {}
+    reddit = report.artifacts.get("reddit_recall")
+    if not isinstance(reddit, dict):
+        reddit = {}
+    enrichment = report.artifacts.get("reddit_comment_enrichment")
+    if not isinstance(enrichment, dict):
+        enrichment = {}
+    group_search = report.artifacts.get("reddit_group_search")
+    if not isinstance(group_search, dict):
+        group_search = {}
+    return {
+        "schema_version": 1,
+        "execution_status": "completed",
+        "raw_source_record_count": statistics.get("raw_source_record_count"),
+        "normalized_stream_item_count": statistics.get("normalized_stream_item_count"),
+        "deduplicated_candidate_count": statistics.get("deduplicated_candidate_count"),
+        "ranked_candidate_count_before_final_reddit_cap": statistics.get("ranked_candidate_count_before_final_reddit_cap"),
+        "final_selected_count": len(report.ranked_candidates),
+        "provisional_reddit_records_before_deduplication": statistics.get("provisional_reddit_records_before_deduplication"),
+        "provisional_unique_reddit_posts_after_deduplication": statistics.get("provisional_unique_reddit_posts_after_deduplication"),
+        "provisional_duplicate_records_merged": statistics.get("provisional_duplicate_records_merged"),
+        "posts_pending_comment_enrichment": statistics.get("posts_pending_comment_enrichment"),
+        "comment_enrichment": enrichment,
+        "reddit_group_search": group_search,
+        "reddit": {
+            "raw_posts": sum((reddit.get("raw_reddit_records_per_subquery") or {}).values()),
+            "posts_removed_by_blocklist": reddit.get("posts_removed_by_blocklist"),
+            "posts_removed_as_commentless": reddit.get("posts_removed_as_commentless"),
+            "posts_removed_as_zero_engagement": reddit.get("posts_removed_as_zero_interaction"),
+            "posts_with_usable_comments": reddit.get("posts_with_usable_comments"),
+            "final_threads": reddit.get("final_rendered_post_count"),
+        },
+    }
+
+
+def _write_run_summary(report: schema.Report, output_path: str) -> None:
+    path = Path(output_path).expanduser().resolve()
+    _ensure_output_directory(path.parent, private=False)
+    path.write_text(json.dumps(build_run_summary(report), indent=2) + "\n", encoding="utf-8")
 
 
 def _propagate_config_to_environ(config: dict[str, object]) -> None:

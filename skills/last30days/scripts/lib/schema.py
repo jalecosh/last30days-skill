@@ -51,6 +51,7 @@ class SubQuery:
     ranking_query: str
     sources: list[str]
     weight: float = 1.0
+    group_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.sources:
@@ -69,6 +70,15 @@ class QueryPlan:
     raw_topic: str
     subqueries: list[SubQuery]
     source_weights: dict[str, float]
+    # Legacy and ordinary plans enrich each Reddit stream immediately.  Company
+    # orchestration may explicitly retain lightweight posts for a later,
+    # company-wide enrichment phase.
+    reddit_comment_enrichment_mode: Literal["immediate", "deferred_company_wide"] = "immediate"
+    reddit_comment_tree_budget: int = 24
+    reddit_search_execution_mode: Literal["legacy_query_scoped", "group_scoped_subreddit_expansion"] = "legacy_query_scoped"
+    reddit_max_discovered_subreddits_per_group: int = 3
+    reddit_max_subreddit_expansion_requests_per_group: int = 3
+    reddit_entity_terms: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
@@ -413,10 +423,19 @@ def subquery_from_dict(payload: dict[str, Any]) -> SubQuery:
         ranking_query=payload["ranking_query"],
         sources=list(payload.get("sources") or []),
         weight=float(payload.get("weight") or 1.0),
+        group_id=payload.get("group_id") if isinstance(payload.get("group_id"), str) else None,
     )
 
 
 def query_plan_from_dict(payload: dict[str, Any]) -> QueryPlan:
+    comment_mode = payload.get("reddit_comment_enrichment_mode")
+    if comment_mode not in {"immediate", "deferred_company_wide"}:
+        comment_mode = "immediate"
+    budget = payload.get("reddit_comment_tree_budget", 24)
+    budget = budget if isinstance(budget, int) and budget > 0 else 24
+    search_mode = payload.get("reddit_search_execution_mode")
+    if search_mode not in {"legacy_query_scoped", "group_scoped_subreddit_expansion"}:
+        search_mode = "legacy_query_scoped"
     return QueryPlan(
         intent=payload["intent"],
         freshness_mode=payload["freshness_mode"],
@@ -424,6 +443,12 @@ def query_plan_from_dict(payload: dict[str, Any]) -> QueryPlan:
         raw_topic=payload["raw_topic"],
         subqueries=[subquery_from_dict(item) for item in payload.get("subqueries") or []],
         source_weights=dict(payload.get("source_weights") or {}),
+        reddit_comment_enrichment_mode=comment_mode,
+        reddit_comment_tree_budget=budget,
+        reddit_search_execution_mode=search_mode,
+        reddit_max_discovered_subreddits_per_group=max(1, int(payload.get("reddit_max_discovered_subreddits_per_group") or 3)),
+        reddit_max_subreddit_expansion_requests_per_group=max(1, int(payload.get("reddit_max_subreddit_expansion_requests_per_group") or 3)),
+        reddit_entity_terms=[str(item) for item in payload.get("reddit_entity_terms", []) if isinstance(item, str)],
         notes=list(payload.get("notes") or []),
     )
 

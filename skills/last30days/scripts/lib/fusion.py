@@ -144,8 +144,15 @@ def weighted_rrf(
 
     for (label, source), items in streams.items():
         subquery = subqueries[label]
-        weight = subquery.weight * plan.source_weights.get(source, 1.0)
         for rank, item in enumerate(items, start=1):
+            # Company-wide Reddit reinsertion keeps one physical item.  Its
+            # explicit discovery provenance, not the transport stream label,
+            # determines a neutral mean subquery weight.
+            provenance_labels = [entry for entry in item.metadata.get("subquery_labels", []) if entry in subqueries]
+            effective_labels = provenance_labels or [label]
+            weight = (
+                sum(subqueries[entry].weight for entry in effective_labels) / len(effective_labels)
+            ) * plan.source_weights.get(source, 1.0)
             key = candidate_key(item)
             score = weight / (RRF_K + rank)
             item_local_relevance = item.local_relevance if item.local_relevance is not None else float(item.metadata.get("local_relevance", item.relevance_hint))
@@ -159,7 +166,7 @@ def weighted_rrf(
                     title=item.title,
                     url=item.url,
                     snippet=item.snippet,
-                    subquery_labels=[label],
+                    subquery_labels=list(effective_labels),
                     native_ranks={f"{label}:{source}": rank},
                     local_relevance=item_local_relevance,
                     freshness=item_freshness,
@@ -169,10 +176,14 @@ def weighted_rrf(
                     sources=[item.source],
                     source_items=[item],
                     metadata={
+                        "group_ids": list(item.metadata.get("group_ids") or ([subquery.group_id] if subquery.group_id else [])),
+                        "search_queries": list(item.metadata.get("search_queries") or [subquery.search_query]),
                         "provenance": [
                             {
                                 "source": source,
                                 "subquery_label": label,
+                                "group_id": subquery.group_id,
+                                "search_query": subquery.search_query,
                                 "native_rank": rank,
                                 "item_id": item.item_id,
                             }
@@ -203,6 +214,12 @@ def weighted_rrf(
             candidate.native_ranks[f"{label}:{source}"] = rank
             if label not in candidate.subquery_labels:
                 candidate.subquery_labels.append(label)
+            group_ids = candidate.metadata.setdefault("group_ids", [])
+            if subquery.group_id and subquery.group_id not in group_ids:
+                group_ids.append(subquery.group_id)
+            search_queries = candidate.metadata.setdefault("search_queries", [])
+            if subquery.search_query not in search_queries:
+                search_queries.append(subquery.search_query)
             if item.source not in candidate.sources:
                 candidate.sources.append(item.source)
             source_item_key = (item.source, item.item_id)
@@ -213,6 +230,8 @@ def weighted_rrf(
                 {
                     "source": source,
                     "subquery_label": label,
+                    "group_id": subquery.group_id,
+                    "search_query": subquery.search_query,
                     "native_rank": rank,
                     "item_id": item.item_id,
                 }

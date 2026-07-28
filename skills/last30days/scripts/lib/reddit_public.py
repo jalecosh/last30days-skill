@@ -243,6 +243,8 @@ def search_reddit_public(
     depth: str = "default",
     subreddits: Optional[List[str]] = None,
     dedicated_subreddits: Optional[List[str]] = None,
+    comment_enrichment: bool = True,
+    base_only: bool = False,
 ) -> List[Dict[str, Any]]:
     """High-level free Reddit search + enrichment (keyless).
 
@@ -271,5 +273,5 @@ def search_reddit_public(
     from . import reddit_keyless
     return reddit_keyless.search_and_enrich(
         topic, from_date, to_date, depth=depth, subreddits=subreddits,
-        dedicated_subreddits=dedicated_subreddits,
+        dedicated_subreddits=dedicated_subreddits, comment_enrichment=comment_enrichment, base_only=base_only,
     )

@@ -2,28 +2,46 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from urllib.parse import urlparse
 
-from . import dates, schema
+from . import dates, reddit_policy, schema
 
 
-# This is intentionally a blocklist, not a discovery boundary. Reddit search remains
-# global; unknown communities retain normal eligibility unless explicitly blocked.
-BLOCKED_SUBREDDITS = {"fuckadobe"}
-# Backward-compatible private name for callers introduced before the policy was named.
+# This is intentionally a post-discovery filter, not a discovery boundary.
+# The runner supplies versioned global policy paths through its subprocess env.
+_REDDIT_POLICY = reddit_policy.policy_from_environment()
+BLOCKED_SUBREDDITS = _REDDIT_POLICY.blocked_subreddits
 EXCLUDED_SUBREDDITS = BLOCKED_SUBREDDITS
-
-# Small post-base-score modifiers. They do not replace Reddit's 35/25/25/15
-# components and are applied only after that four-signal score is calculated.
-# Global boosts must be reusable across stock, company, and investment searches:
-# entity-, product-, profession-, and topic-specific communities (for example
-# r/Adobe) must not receive a global boost. Any such preference needs a separate
-# scoped subsystem keyed to the current entity or topic; none is implemented here.
-SUBREDDIT_QUALITY_MULTIPLIERS = {
-    "valueinvesting": 1.08,
-}
+SUBREDDIT_QUALITY_MULTIPLIERS = _REDDIT_POLICY.preferred_subreddits
 DEFAULT_SUBREDDIT_QUALITY_MULTIPLIER = 1.00
+COMMENT_NOT_ENRICHED = "not_enriched"
+COMMENT_ENRICHED_USABLE = "enriched_usable"
+COMMENT_ENRICHED_EMPTY = "enriched_empty"
+COMMENT_ENRICHMENT_FAILED = "enrichment_failed"
+COMMENT_STATES = frozenset({COMMENT_NOT_ENRICHED, COMMENT_ENRICHED_USABLE, COMMENT_ENRICHED_EMPTY, COMMENT_ENRICHMENT_FAILED})
+
+
+def genuine_reddit_post_id(value: Any) -> str:
+    """Return a permanent Reddit post id, never a stream-local ``R1`` id."""
+    candidate = str(value or "").strip().lower().removeprefix("t3_")
+    if re.fullmatch(r"r\d+", candidate):
+        return ""
+    return candidate if re.fullmatch(r"[a-z0-9]{3,}", candidate) else ""
+
+
+def configure_reddit_policy(blocklist_path: str | None = None, preferences_path: str | None = None) -> None:
+    """Reload policy for an embedding host or a focused unit test."""
+    global _REDDIT_POLICY, BLOCKED_SUBREDDITS, EXCLUDED_SUBREDDITS, SUBREDDIT_QUALITY_MULTIPLIERS
+    from pathlib import Path
+    _REDDIT_POLICY = reddit_policy.load_policy(
+        Path(blocklist_path) if blocklist_path else None,
+        Path(preferences_path) if preferences_path else None,
+    )
+    BLOCKED_SUBREDDITS = _REDDIT_POLICY.blocked_subreddits
+    EXCLUDED_SUBREDDITS = BLOCKED_SUBREDDITS
+    SUBREDDIT_QUALITY_MULTIPLIERS = _REDDIT_POLICY.preferred_subreddits
 
 
 def _normalized_subreddit_name(value: object) -> str:
@@ -77,6 +95,7 @@ def normalize_source_items(
     from_date: str,
     to_date: str,
     freshness_mode: str = "balanced_recent",
+    comment_validation: str = "immediate",
 ) -> list[schema.SourceItem]:
     """Normalize raw source items, filter by date range, with evergreen fallback for how_to queries."""
     source = source.lower()
@@ -109,6 +128,8 @@ def normalize_source_items(
     normalizer = normalizers.get(source)
     if normalizer is None:
         raise ValueError(f"Unsupported source: {source}")
+    if comment_validation not in {"immediate", "deferred"}:
+        raise ValueError("comment_validation must be 'immediate' or 'deferred'")
     normalized = [normalizer(source, item, index, from_date, to_date) for index, item in enumerate(items)]
     if source == "reddit":
         # Hard exclusions apply before fusion/ranking and are never restored as
@@ -117,12 +138,7 @@ def normalize_source_items(
             item for item in normalized
             if not _is_excluded_reddit_subreddit(item.container)
         ]
-        # Comment enrichment is the evidence for Reddit discussions. Do not let
-        # an un-enriched or commentless post reach fusion/the final report.
-        normalized = [
-            item for item in normalized
-            if item.metadata.get("comment_tree") or item.metadata.get("top_comments")
-        ]
+        normalized = validate_reddit_comment_evidence(normalized, mode=comment_validation)
     if source == "jobs":
         # A careers board is a snapshot of CURRENTLY OPEN roles. An open posting
         # is current evidence regardless of when it was posted, so date-windowing
@@ -139,6 +155,21 @@ def normalize_source_items(
             return [item for item in normalized if item.published_at]
         return normalized
     return filtered
+
+
+def validate_reddit_comment_evidence(items: list[schema.SourceItem], *, mode: str = "immediate") -> list[schema.SourceItem]:
+    """Apply post-enrichment evidence eligibility without conflating pending with empty."""
+    kept: list[schema.SourceItem] = []
+    for item in items:
+        state = item.metadata.get("comment_enrichment_state")
+        if state not in COMMENT_STATES:
+            state = COMMENT_ENRICHED_USABLE if (item.metadata.get("comment_tree") or item.metadata.get("top_comments")) else COMMENT_ENRICHED_EMPTY
+            item.metadata["comment_enrichment_state"] = state
+        if state == COMMENT_ENRICHED_USABLE:
+            kept.append(item)
+        elif state == COMMENT_NOT_ENRICHED and mode == "deferred":
+            kept.append(item)
+    return kept
 
 
 def _remap_comments(
@@ -326,6 +357,9 @@ def _normalize_reddit(
         ]
         if part
     )
+    comment_state = item.get("comment_enrichment_state")
+    if comment_state not in COMMENT_STATES:
+        comment_state = COMMENT_ENRICHED_USABLE if (item.get("comment_tree") or top_comments) else COMMENT_ENRICHED_EMPTY
     return _source_item(
         item_id=str(item.get("id") or f"R{index + 1}"),
         source=source,
@@ -343,6 +377,8 @@ def _normalize_reddit(
         metadata={
             "comment_tree": item.get("comment_tree") or [],
             "top_comments": top_comments,
+            "comment_enrichment_state": comment_state,
+            "reddit_post_id": genuine_reddit_post_id(item.get("reddit_id") or item.get("post_id")),
             # Preserve the raw post body separately from comment excerpts so
             # topic eligibility can distinguish post centrality from a side comment.
             "reddit_post_body": str(item.get("selftext") or item.get("body") or item.get("description") or ""),

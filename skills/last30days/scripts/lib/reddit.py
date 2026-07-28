@@ -547,6 +547,24 @@ def fetch_post_comments(
         return []
 
 
+def enrich_scrapecreators_post_comments(url: str, token: str) -> dict[str, Any]:
+    """Fetch and project one already-discovered post's comments.
+
+    This deliberately does not invoke Reddit search or subreddit discovery.
+    """
+    raw_comments = fetch_post_comments(url, token)
+    if not raw_comments:
+        return {"comment_tree": [], "top_comments": [], "comment_insights": []}
+    tree = _project_comment_tree(raw_comments)
+    flat = _flatten_comment_tree(tree)
+    ranked = sorted(flat, key=_comment_score, reverse=True)
+    top = [{
+        "score": comment["score"], "date": _parse_date(comment.get("created_utc")) or _parse_date(comment.get("date")),
+        "author": comment["author"], "excerpt": comment["excerpt"], "url": comment["url"],
+    } for comment in ranked[:MAX_TOP_COMMENTS]]
+    return {"comment_tree": tree, "top_comments": top, "comment_insights": [entry["excerpt"] for entry in top]}
+
+
 def _dedupe_posts(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Deduplicate posts by reddit_id, keeping first occurrence."""
     seen_ids = set()
@@ -574,6 +592,7 @@ def search_reddit(
     depth: str = "default",
     token: str = None,
     subreddits: List[str] | None = None,
+    subreddit_expansion: bool = True,
 ) -> Dict[str, Any]:
     """Full Reddit search: multi-query global discovery + subreddit drill-down.
 
@@ -647,7 +666,7 @@ def search_reddit(
         all_items.append(item)
 
     # === Phase 3: Subreddit Discovery + Targeted Search ===
-    subreddit_budget = 0 if intent == "how_to" else config["subreddit_searches"]
+    subreddit_budget = (0 if intent == "how_to" else config["subreddit_searches"]) if subreddit_expansion else 0
     discovered_subs = discover_subreddits(all_raw_posts, topic=topic, max_subs=subreddit_budget)
     _log(f"Discovered subreddits: {discovered_subs}")
 
@@ -715,6 +734,21 @@ def search_reddit(
 
     _log(f"Final: {len(all_items)} Reddit posts")
     return {"items": all_items}
+
+
+def search_reddit_in_subreddits(
+    topic: str, subreddits: List[str], *, depth: str = "default", token: str = None,
+) -> list[dict[str, Any]]:
+    """Target already-chosen subreddits without global search or rediscovery."""
+    if not token:
+        return []
+    config = DEPTH_CONFIG.get(depth, DEPTH_CONFIG["default"])
+    core = _extract_core_subject(topic)
+    items: list[dict[str, Any]] = []
+    for sub in subreddits:
+        for post in _subreddit_search(sub, core, token, "relevance", config["timeframe"]):
+            items.append(_normalize_post(post, len(items) + 1, f"r/{sub}", query=core))
+    return _dedupe_posts(items)
 
 
 def enrich_with_comments(
@@ -830,6 +864,8 @@ def search_and_enrich(
     depth: str = "default",
     token: str = None,
     subreddits: List[str] | None = None,
+    comment_enrichment: bool = True,
+    subreddit_expansion: bool = True,
 ) -> Dict[str, Any]:
     """Full Reddit pipeline: search + comment enrichment.
 
@@ -846,12 +882,15 @@ def search_and_enrich(
     Returns:
         Dict with 'items' list. Items include top_comments and comment_insights.
     """
-    result = search_reddit(topic, from_date, to_date, depth, token, subreddits=subreddits)
+    result = search_reddit(topic, from_date, to_date, depth, token, subreddits=subreddits, subreddit_expansion=subreddit_expansion)
     items = result.get("items", [])
 
-    if items and token:
+    if items and token and comment_enrichment:
         items = enrich_with_comments(items, token, depth)
         result["items"] = items
+    elif not comment_enrichment:
+        for item in items:
+            item["comment_enrichment_state"] = "not_enriched"
 
     return result
 

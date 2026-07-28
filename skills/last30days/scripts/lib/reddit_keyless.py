@@ -71,6 +71,7 @@ def _discover(
     depth: str,
     subreddits: Optional[List[str]],
     dedicated_subreddits: Optional[List[str]] = None,
+    base_only: bool = False,
 ) -> List[Dict[str, Any]]:
     # Dedicated lane: the entity's home subs are wholly on-topic. Pull
     # top+hot+new (real scores from the listing) and mark them floor-exempt so
@@ -101,7 +102,7 @@ def _discover(
         # would flood results with high-upvote but irrelevant posts.
         listing_posts = []
         derived = _top_subreddits(rss_posts)
-        score_source = reddit_listing.fetch_listings(derived, depth=depth, query=topic)
+        score_source = [] if base_only else reddit_listing.fetch_listings(derived, depth=depth, query=topic)
     _log(
         f"Tier 1 (RSS) {len(rss_posts)} posts; "
         f"{'listing discovery ' + str(len(listing_posts)) if subreddits else 'score-only'}; "
@@ -170,6 +171,16 @@ def _enrich_one(post: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass  # keep the post with whatever discovery gave us
     return post
+
+
+def enrich_public_post_comments(url: str) -> Dict[str, Any]:
+    """Fetch comments for an already-discovered URL without re-searching."""
+    data = reddit_shreddit.fetch_comments(url)
+    return {
+        "comment_tree": data.get("comment_tree") or [],
+        "top_comments": data.get("top_comments") or [],
+        "comment_insights": data.get("comment_insights") or [],
+    }
 
 
 def _enrich(posts: List[Dict[str, Any]], depth: str) -> List[Dict[str, Any]]:
@@ -256,6 +267,8 @@ def search_and_enrich(
     depth: str = "default",
     subreddits: Optional[List[str]] = None,
     dedicated_subreddits: Optional[List[str]] = None,
+    comment_enrichment: bool = True,
+    base_only: bool = False,
 ) -> List[Dict[str, Any]]:
     """Full keyless Reddit pipeline: discover then enrich.
 
@@ -273,7 +286,7 @@ def search_and_enrich(
         with top_comments/comment_insights attached on enriched posts.
         Empty list when all keyless tiers fail (so SC backup can engage).
     """
-    posts = _discover(topic, depth, subreddits, dedicated_subreddits)
+    posts = _discover(topic, depth, subreddits, dedicated_subreddits, base_only=base_only)
     if not posts:
         return []
 
@@ -309,7 +322,12 @@ def search_and_enrich(
     # Enrichment slot selection is relevance-aware: entity-matching posts
     # claim the scarce comment slots first (score order preserved within
     # each tier).
-    posts = _enrich(_slot_priority(topic, posts), depth)
+    posts = _slot_priority(topic, posts)
+    if comment_enrichment:
+        posts = _enrich(posts, depth)
+    else:
+        for post in posts:
+            post["comment_enrichment_state"] = "not_enriched"
 
     # Final display order ranks relevance-first with a bounded engagement bonus,
     # so an off-topic high-upvote post can't outrank an on-topic one in what the
@@ -319,4 +337,16 @@ def search_and_enrich(
     for i, post in enumerate(posts):
         post["id"] = f"R{i + 1}"
 
+    return posts
+
+
+def search_public_in_subreddits(
+    topic: str, subreddits: list[str], *, from_date: str, to_date: str, depth: str = "default",
+) -> list[dict[str, Any]]:
+    """Target selected subreddits only: no global RSS, rediscovery, or comments."""
+    posts = _discover(topic, depth, subreddits, base_only=True)
+    posts = [post for post in posts if post.get("date") is None or from_date <= post["date"] <= to_date]
+    for index, post in enumerate(posts, start=1):
+        post["id"] = f"R{index}"
+        post["comment_enrichment_state"] = "not_enriched"
     return posts

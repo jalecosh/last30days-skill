@@ -1,0 +1,12 @@
+{
+  "ticker": "PTC",
+  "company_name": "PTC",
+  "legal_name": "PTC Inc.",
+  "exchange": "NASDAQ",
+  "market": "US equities",
+  "aliases": ["PTC", "Parametric Technology Corporation"],
+  "products": ["Creo", "Windchill", "ThingWorx", "Vuforia", "Codebeamer", "Arena"],
+  "search_groups": [
+    {"id": "cad-plm", "ranking_query": "What are Reddit users saying about PTC's CAD and PLM products?", "queries": ["PTC Creo Windchill CAD PLM"]}
+  ]
+}

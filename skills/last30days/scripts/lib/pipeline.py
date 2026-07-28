@@ -17,6 +17,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from shutil import which
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from . import (
     arxiv,
@@ -50,6 +51,7 @@ from . import (
     providers,
     query,
     reddit,
+    reddit_keyless,
     reddit_listing,
     reddit_topic_eligibility,
     reddit_public,
@@ -87,6 +89,15 @@ DEPTH_SETTINGS = {
 
 # This is a ceiling, never a fill target. Non-Reddit sources are unaffected.
 MAX_FINAL_REDDIT_POSTS = 15
+
+
+COMPANY_REDDIT_GROUP_ALLOCATION = (
+    ("investment_and_valuation", 8),
+    ("business_performance", 5),
+    ("competition_and_future", 5),
+    ("management_and_internal", 3),
+    ("customer_and_product_evidence", 3),
+)
 
 # Reddit-only multi-angle runs need enough headroom for each query angle to
 # contribute before the normal global rerank. These are bounded recall limits,
@@ -169,6 +180,7 @@ def _reddit_raw_stats(items: list[dict[str, Any]]) -> dict[str, int]:
     usable_comments = 0
     zero_interaction = 0
     submitted_for_comment_enrichment = 0
+    pending_comment_enrichment = 0
     for item in items:
         if item.get("_comment_enrichment_attempted"):
             submitted_for_comment_enrichment += 1
@@ -176,7 +188,9 @@ def _reddit_raw_stats(items: list[dict[str, Any]]) -> dict[str, int]:
         if normalize._is_excluded_reddit_subreddit(subreddit):
             blocked += 1
             continue
-        if _reddit_has_usable_comments(item):
+        if item.get("comment_enrichment_state") == "not_enriched":
+            pending_comment_enrichment += 1
+        elif _reddit_has_usable_comments(item):
             usable_comments += 1
         else:
             commentless += 1
@@ -198,6 +212,7 @@ def _reddit_raw_stats(items: list[dict[str, Any]]) -> dict[str, int]:
         "posts_removed_as_commentless": commentless,
         "posts_removed_by_blocklist": blocked,
         "posts_removed_as_zero_interaction": zero_interaction,
+        "posts_pending_comment_enrichment": pending_comment_enrichment,
     }
 
 
@@ -2103,6 +2118,12 @@ def run(
         else:
             plan_source = "deterministic"
 
+    # Structured plan behavior: legacy plans default to immediate enrichment;
+    # external grouped plans may explicitly retain provisional Reddit posts.
+    config = dict(config)
+    config["_reddit_comment_enrichment_mode"] = plan.reddit_comment_enrichment_mode
+    config["_reddit_search_execution_mode"] = plan.reddit_search_execution_mode
+
     # Safety net: ensure grounding appears in all subqueries even if the planner
     # omits it. This is redundant when the planner includes grounding via
     # SOURCE_CAPABILITIES, but kept as a fallback.
@@ -2297,6 +2318,7 @@ def run(
         "posts_removed_as_commentless": 0,
         "posts_removed_by_blocklist": 0,
         "posts_removed_as_zero_interaction": 0,
+        "posts_pending_comment_enrichment": 0,
         "topic_gate_applied": adobe_reddit_topic_gate,
         "candidates_evaluated_by_topic_gate": 0,
         "candidates_accepted_by_topic_gate": 0,
@@ -2305,6 +2327,25 @@ def run(
         "accepted_count_per_subquery": {},
         "accepted_count_per_subreddit": {},
     }
+    run_statistics: dict[str, int] = {
+        "raw_source_record_count": 0,
+        "normalized_stream_item_count": 0,
+        "deduplicated_candidate_count": 0,
+        "ranked_candidate_count_before_final_reddit_cap": 0,
+        "final_selected_count": 0,
+        "provisional_reddit_records_before_deduplication": 0,
+        "provisional_unique_reddit_posts_after_deduplication": 0,
+        "provisional_duplicate_records_merged": 0,
+        "posts_pending_comment_enrichment": 0,
+    }
+    bundle.artifacts["run_statistics"] = run_statistics
+    provisional_reddit_items: list[schema.SourceItem] = []
+    if plan.reddit_search_execution_mode == "group_scoped_subreddit_expansion":
+        bundle.artifacts["reddit_group_search"] = {
+            "base_search_primary_attempts": 0, "base_search_primary_usable": 0,
+            "base_search_primary_empty": 0, "base_search_primary_failed": 0,
+            "base_search_public_fallbacks": 0,
+        }
     # Per-source fetch budget prevents redundant API calls
     source_fetch_count: dict[str, int] = {}
     stream_count = sum(
@@ -2412,6 +2453,7 @@ def run(
                 for key, value in stats.items():
                     if key != "raw_records":
                         reddit_recall[key] += value
+            run_statistics["raw_source_record_count"] += len(raw_items)
             outcome_note = None
             if isinstance(artifact, dict) and artifact.get("_source_outcome"):
                 artifact = dict(artifact)
@@ -2422,10 +2464,24 @@ def run(
                     outcome_note["detail"],
                     attempted=outcome_note.get("attempted", True),
                 )
+            if source == "reddit" and plan.reddit_search_execution_mode == "group_scoped_subreddit_expansion":
+                diagnostics = (artifact or {}).get("reddit_search_diagnostics") if isinstance(artifact, dict) else None
+                if isinstance(diagnostics, dict):
+                    aggregate = bundle.artifacts["reddit_group_search"]
+                    aggregate["base_search_primary_attempts"] += diagnostics.get("primary_search_attempts", 0)
+                    aggregate["base_search_primary_usable"] += diagnostics.get("primary_search_usable", 0)
+                    aggregate["base_search_primary_empty"] += diagnostics.get("primary_search_empty", 0)
+                    aggregate["base_search_primary_failed"] += diagnostics.get("primary_search_failed", 0)
+                    aggregate["base_search_public_fallbacks"] += diagnostics.get("public_fallback_invocations", 0)
             normalized = _normalize_score_dedupe(
                 source, raw_items, from_date, to_date,
                 freshness_mode=plan.freshness_mode,
                 ranking_query=subquery.ranking_query,
+                comment_validation=(
+                    "deferred"
+                    if source == "reddit" and plan.reddit_comment_enrichment_mode == "deferred_company_wide"
+                    else "immediate"
+                ),
             )
             if source == "reddit" and adobe_reddit_topic_gate:
                 gate_results = [
@@ -2482,9 +2538,71 @@ def run(
             # strategic postings (the whole point of hiring-signals coverage).
             if source != "jobs":
                 normalized = normalized[: settings["per_stream_limit"]]
-            bundle.add_items(subquery.label, source, normalized)
+            for item in normalized:
+                _attach_subquery_provenance(item, subquery)
+            run_statistics["normalized_stream_item_count"] += len(normalized)
+            if source == "reddit" and plan.reddit_comment_enrichment_mode == "deferred_company_wide":
+                provisional_reddit_items.extend(normalized)
+            else:
+                bundle.add_items(subquery.label, source, normalized)
             if artifact:
                 bundle.artifacts.setdefault("grounding", []).append(artifact)
+
+    if plan.reddit_comment_enrichment_mode == "deferred_company_wide":
+        if plan.reddit_search_execution_mode == "group_scoped_subreddit_expansion":
+            search_counters = bundle.artifacts["reddit_group_search"]
+            group_order = list(dict.fromkeys(subquery.group_id for subquery in plan.subqueries if subquery.group_id))
+            for group_id in group_order:
+                group_base = [item for item in provisional_reddit_items if group_id in (item.metadata.get("group_ids") or [])]
+                representative = next(subquery for subquery in plan.subqueries if subquery.group_id == group_id)
+                expanded, counts = expand_group_reddit_subreddits(
+                    group_id=group_id, base_items=group_base, representative=representative, config=config,
+                    depth=depth, from_date=from_date, to_date=to_date,
+                    max_subreddits=min(
+                        plan.reddit_max_discovered_subreddits_per_group,
+                        plan.reddit_max_subreddit_expansion_requests_per_group,
+                    ), freshness_mode=plan.freshness_mode,
+                )
+                provisional_reddit_items.extend(expanded)
+                for key, value in counts.items():
+                    search_counters[key] = search_counters.get(key, 0) + value
+        provisional_unique = merge_provisional_reddit_items(provisional_reddit_items)
+        if plan.reddit_entity_terms:
+            provisional_unique = [
+                item for item in provisional_unique
+                if matches_company_entity(
+                    item.title,
+                    item.metadata.get("reddit_post_body"),
+                    plan.reddit_entity_terms,
+                )
+            ]
+        before = len(provisional_reddit_items)
+        after = len(provisional_unique)
+        run_statistics["provisional_reddit_records_before_deduplication"] = before
+        run_statistics["provisional_unique_reddit_posts_after_deduplication"] = after
+        run_statistics["provisional_duplicate_records_merged"] = before - after
+        run_statistics["posts_pending_comment_enrichment"] = after
+        # Deliberately excluded from items_by_source and fusion until Phase 3C
+        # validates comment evidence.  The artifact lets that phase reuse the
+        # completed discovery work without re-running searches.
+        bundle.artifacts["provisional_reddit_items"] = provisional_unique
+        group_order = list(dict.fromkeys(
+            subquery.group_id for subquery in plan.subqueries if subquery.group_id
+        ))
+        enriched_reddit, enrichment_counters = enrich_provisional_reddit_items(
+            provisional_unique,
+            config=config,
+            budget=plan.reddit_comment_tree_budget,
+            group_order=group_order,
+        )
+        bundle.artifacts["reddit_comment_enrichment"] = enrichment_counters
+        # Selected-but-empty/failed posts are terminally excluded. Budget-skipped
+        # posts remain pending in the artifact, never as final evidence.
+        run_statistics["posts_pending_comment_enrichment"] = enrichment_counters["posts_skipped_by_comment_tree_budget"]
+        if enriched_reddit:
+            # Fusion requires a label that exists in QueryPlan.  Provenance for
+            # every originating query remains on the one logical SourceItem.
+            bundle.add_items(plan.subqueries[0].label, "reddit", enriched_reddit)
 
     # Phase 2: supplemental entity-based searches
     _run_supplemental_searches(
@@ -2570,6 +2688,7 @@ def run(
             REDDIT_SUBQUERY_CANDIDATE_ALLOWANCE if reddit_only_plan else 0
         ),
     )
+    run_statistics["deduplicated_candidate_count"] = len(candidates)
     for candidate in candidates:
         primary = schema.candidate_primary_item(candidate)
         if primary is not None and primary.source == "reddit" and "topic_eligible" in primary.metadata:
@@ -2645,10 +2764,21 @@ def run(
         if (primary := schema.candidate_primary_item(candidate)) is not None
         and primary.source == "reddit"
     )
+    run_statistics["ranked_candidate_count_before_final_reddit_cap"] = len(ranked_candidates)
     ranked_candidates, items_by_source = _cap_final_reddit_posts(
-        ranked_candidates, items_by_source,
+        ranked_candidates,
+        items_by_source,
+        company_group_allocation=(
+            COMPANY_REDDIT_GROUP_ALLOCATION
+            if plan.reddit_entity_terms and any(
+                subquery.group_id in dict(COMPANY_REDDIT_GROUP_ALLOCATION)
+                for subquery in plan.subqueries
+            )
+            else None
+        ),
     )
     reddit_recall["final_rendered_post_count"] = len(items_by_source.get("reddit", []))
+    run_statistics["final_selected_count"] = len(ranked_candidates)
     bundle.artifacts["reddit_recall"] = reddit_recall
 
     # Phase 3: post-rerank GitHub star enrichment. Record/replay-aware so the
@@ -2890,11 +3020,12 @@ def _normalize_score_dedupe(
     to_date: str,
     freshness_mode: str,
     ranking_query: str,
+    comment_validation: str = "immediate",
 ) -> list[schema.SourceItem]:
     """Normalize, annotate, prune, dedupe, and extract snippets for a batch of raw items."""
     normalized = normalize.normalize_source_items(
         source, raw_items, from_date, to_date,
-        freshness_mode=freshness_mode,
+        freshness_mode=freshness_mode, comment_validation=comment_validation,
     )
     prepared_query = relevance.PreparedQuery(ranking_query)
     lookback_window_days = (
@@ -2919,6 +3050,19 @@ def _normalize_score_dedupe(
     return normalized
 
 
+def _attach_subquery_provenance(item: schema.SourceItem, subquery: schema.SubQuery) -> None:
+    """Keep explicit flat-plan group/query provenance on normalized evidence."""
+    item.metadata.setdefault("group_ids", [])
+    if subquery.group_id and subquery.group_id not in item.metadata["group_ids"]:
+        item.metadata["group_ids"].append(subquery.group_id)
+    item.metadata.setdefault("subquery_labels", [])
+    if subquery.label not in item.metadata["subquery_labels"]:
+        item.metadata["subquery_labels"].append(subquery.label)
+    item.metadata.setdefault("search_queries", [])
+    if subquery.search_query not in item.metadata["search_queries"]:
+        item.metadata["search_queries"].append(subquery.search_query)
+
+
 def _dedupe_reddit_items_by_canonical_identity(
     items: list[schema.SourceItem],
 ) -> list[schema.SourceItem]:
@@ -2932,6 +3076,270 @@ def _dedupe_reddit_items_by_canonical_identity(
         seen.add(key)
         kept.append(item)
     return kept
+
+
+def canonical_reddit_identity(item: schema.SourceItem) -> str:
+    """Stable Reddit identity: API post id, canonical comments URL, then URL."""
+    post_id = str(item.metadata.get("reddit_post_id") or "").strip().lower()
+    if post_id:
+        return f"reddit-id:{post_id.removeprefix('t3_')}"
+    if item.url:
+        parsed = urlsplit(item.url)
+        host = parsed.netloc.lower().removeprefix("www.").removeprefix("old.")
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if len(path_parts) >= 4 and path_parts[0].lower() == "r" and path_parts[2].lower() == "comments":
+            path = "/" + "/".join(path_parts[:4])
+        else:
+            path = parsed.path.rstrip("/")
+        return f"reddit-url:{urlunsplit(('https', host, path, '', ''))}"
+    # Stream-local R1/R2 identifiers are not Reddit identities.  Unknown
+    # identity records must stay distinct rather than risk a false merge.
+    return f"reddit-unidentified:{id(item)}"
+
+
+def merge_provisional_reddit_items(items: list[schema.SourceItem]) -> list[schema.SourceItem]:
+    """Company-wide dedupe for discovery-only Reddit evidence, preserving provenance."""
+    merged: dict[str, schema.SourceItem] = {}
+    for item in items:
+        key = canonical_reddit_identity(item)
+        existing = merged.get(key)
+        if existing is None:
+            item.metadata["provisional_records_merged"] = 1
+            item.metadata.setdefault("discovery_sources", [])
+            if item.why_relevant and item.why_relevant not in item.metadata["discovery_sources"]:
+                item.metadata["discovery_sources"].append(item.why_relevant)
+            merged[key] = item
+            continue
+        existing.metadata["provisional_records_merged"] = int(existing.metadata.get("provisional_records_merged", 1)) + 1
+        for field in ("group_ids", "subquery_labels", "search_queries", "discovery_sources"):
+            existing.metadata.setdefault(field, [])
+            for value in item.metadata.get(field, []):
+                if value not in existing.metadata[field]:
+                    existing.metadata[field].append(value)
+        for field in ("score", "num_comments"):
+            existing.engagement[field] = max(
+                float(existing.engagement.get(field) or 0), float(item.engagement.get(field) or 0)
+            )
+        for field in ("container", "published_at", "body", "snippet", "title", "url"):
+            if not getattr(existing, field) and getattr(item, field):
+                setattr(existing, field, getattr(item, field))
+    return list(merged.values())
+
+
+def reddit_preliminary_components(item: schema.SourceItem) -> dict[str, float]:
+    """Bounded inputs for selecting comment-enrichment work, not final rank."""
+    relevance_score = item.local_relevance if item.local_relevance is not None else item.relevance_hint
+    return {
+        "relevance": max(0.0, min(1.0, float(relevance_score or 0.0))),
+        # signals.freshness is an integer 0..100, while reddit_rank_score uses 0..1.
+        "freshness": max(0.0, min(1.0, float(item.freshness or 0.0) / 100.0)),
+        "comments": signals.reddit_bounded_engagement(item.engagement.get("num_comments")),
+        "score": signals.reddit_bounded_engagement(item.engagement.get("score")),
+    }
+
+
+def _reddit_preliminary_key(item: schema.SourceItem) -> tuple[float, float, float, int, str]:
+    """Deterministic pre-comment priority only; final Reddit ranking is unchanged."""
+    raw_score = float(item.engagement.get("score") or 0)
+    raw_comments = float(item.engagement.get("num_comments") or 0)
+    components = reddit_preliminary_components(item)
+    preliminary = signals.reddit_rank_score(
+        components["relevance"], components["freshness"], components["comments"], components["score"],
+    )
+    date_tiebreak = int(re.sub(r"\D", "", str(item.published_at or ""))[:8] or 0)
+    return (-preliminary, -raw_comments, -raw_score, -date_tiebreak, canonical_reddit_identity(item))
+
+
+_GENERIC_COMPANY_ENTITY_TERMS = frozenset({
+    "ai", "software", "cad", "cloud", "pricing", "subscription", "valuation", "earnings", "strategy", "stock",
+})
+
+
+def matches_company_entity(title: str, body: str, entities: list[str]) -> bool:
+    """Match a validated company entity in a Reddit title."""
+    normalized_entities = []
+    for entity in entities:
+        normalized = " ".join(str(entity or "").casefold().split())
+        if normalized and normalized not in _GENERIC_COMPANY_ENTITY_TERMS and normalized not in normalized_entities:
+            normalized_entities.append(normalized)
+    normalized_entities.sort(key=lambda value: (len(value.split()), len(value)))
+    normalized_entities = [
+        entity for entity in normalized_entities
+        if not any(re.search(r"(?<!\w)" + re.escape(candidate) + r"(?!\w)", entity)
+                   for candidate in normalized_entities if candidate != entity)
+    ]
+    title_text = " ".join(str(title or "").casefold().split())
+    for entity in normalized_entities:
+        pattern = r"(?<!\w)" + r"\s+".join(re.escape(token) for token in entity.split()) + r"(?!\w)"
+        if re.search(pattern, title_text):
+            return True
+    return False
+
+def _select_provisional_reddit_items(
+    items: list[schema.SourceItem], budget: int, group_order: list[str],
+) -> list[schema.SourceItem]:
+    """Round-robin represented groups, choosing each queue by preliminary quality."""
+    ranked = sorted(items, key=_reddit_preliminary_key)
+    queues: dict[str, list[schema.SourceItem]] = {group: [] for group in group_order}
+    for item in ranked:
+        groups = item.metadata.get("group_ids") or []
+        group = next((entry for entry in group_order if entry in groups), groups[0] if groups else "ungrouped")
+        queues.setdefault(group, []).append(item)
+    selected: list[schema.SourceItem] = []
+    while len(selected) < budget and any(queues.values()):
+        progressed = False
+        for group in [*group_order, *(entry for entry in queues if entry not in group_order)]:
+            if len(selected) >= budget:
+                break
+            if queues.get(group):
+                selected.append(queues[group].pop(0))
+                progressed = True
+        if not progressed:
+            break
+    return selected
+
+
+def enrich_provisional_reddit_items(
+    items: list[schema.SourceItem], *, config: dict[str, Any], budget: int, group_order: list[str],
+    cache: dict[str, tuple[str, dict[str, Any]]] | None = None,
+) -> tuple[list[schema.SourceItem], dict[str, int]]:
+    """Enrich already-discovered posts once each; never performs a post search."""
+    counters = {key: 0 for key in (
+        "unique_posts_considered_for_comment_enrichment", "posts_selected_for_comment_enrichment",
+        "posts_skipped_by_comment_tree_budget", "posts_enriched_usable", "posts_enriched_empty",
+        "posts_enrichment_failed",
+        "comment_tree_cache_hits", "scrapecreators_comment_attempts",
+        "scrapecreators_comment_usable_responses", "scrapecreators_comment_empty_responses",
+        "scrapecreators_comment_failures", "public_comment_attempts", "public_comment_usable_responses",
+        "public_comment_empty_responses", "public_comment_failures", "public_comment_fallbacks",
+    )}
+    unique = merge_provisional_reddit_items(items)
+    counters["unique_posts_considered_for_comment_enrichment"] = len(unique)
+    selected = _select_provisional_reddit_items(unique, budget, group_order)
+    counters["posts_selected_for_comment_enrichment"] = len(selected)
+    counters["posts_skipped_by_comment_tree_budget"] = len(unique) - len(selected)
+    cache = cache if cache is not None else {}
+    for item in selected:
+        key = canonical_reddit_identity(item)
+        item.metadata["canonical_reddit_identity"] = key
+        if key in cache:
+            counters["comment_tree_cache_hits"] += 1
+            state, payload = cache[key]
+        else:
+            state, payload = normalize.COMMENT_ENRICHMENT_FAILED, {}
+            token = config.get("SCRAPECREATORS_API_KEY")
+            if token:
+                counters["scrapecreators_comment_attempts"] += 1
+                try:
+                    payload = reddit.enrich_scrapecreators_post_comments(item.url, token)
+                    if payload.get("comment_tree") or payload.get("top_comments"):
+                        state = normalize.COMMENT_ENRICHED_USABLE
+                        counters["scrapecreators_comment_usable_responses"] += 1
+                    else:
+                        counters["scrapecreators_comment_empty_responses"] += 1
+                except Exception:
+                    counters["scrapecreators_comment_failures"] += 1
+            if state != normalize.COMMENT_ENRICHED_USABLE:
+                counters["public_comment_attempts"] += 1
+                if token:
+                    counters["public_comment_fallbacks"] += 1
+                try:
+                    payload = reddit_keyless.enrich_public_post_comments(item.url)
+                    state = (normalize.COMMENT_ENRICHED_USABLE if (payload.get("comment_tree") or payload.get("top_comments")) else normalize.COMMENT_ENRICHED_EMPTY)
+                    counters["public_comment_usable_responses" if state == normalize.COMMENT_ENRICHED_USABLE else "public_comment_empty_responses"] += 1
+                except Exception:
+                    state, payload = normalize.COMMENT_ENRICHMENT_FAILED, {}
+                    counters["public_comment_failures"] += 1
+            # Usable and confirmed-empty results are cacheable. Failures remain
+            # uncached so a future bounded retry policy can retry them.
+            if state in {normalize.COMMENT_ENRICHED_USABLE, normalize.COMMENT_ENRICHED_EMPTY}:
+                cache[key] = (state, payload)
+        item.metadata.update(payload)
+        item.metadata["comment_enrichment_state"] = state
+        if state == normalize.COMMENT_ENRICHED_USABLE:
+            counters["posts_enriched_usable"] += 1
+        elif state == normalize.COMMENT_ENRICHED_EMPTY:
+            counters["posts_enriched_empty"] += 1
+        else:
+            counters["posts_enrichment_failed"] += 1
+    usable = normalize.validate_reddit_comment_evidence(selected, mode="immediate")
+    return usable, counters
+
+
+def expand_group_reddit_subreddits(
+    *, group_id: str, base_items: list[schema.SourceItem], representative: schema.SubQuery,
+    config: dict[str, Any], depth: str, from_date: str, to_date: str, max_subreddits: int, freshness_mode: str,
+) -> tuple[list[schema.SourceItem], dict[str, int]]:
+    """One post-base expansion pass per group; searches are never rerun here."""
+    candidates = [
+        {"subreddit": item.container, "score": item.engagement.get("score", 0), "votes": item.engagement.get("score", 0)}
+        for item in base_items if not normalize._is_excluded_reddit_subreddit(item.container)
+    ]
+    # The group's validated ranking query is stable even if its discovery
+    # expressions are reordered; it is the explicit expansion query.
+    expansion_query = representative.ranking_query
+    discovered = reddit.discover_subreddits(candidates, topic=expansion_query, max_subs=max_subreddits)
+    seen_subreddits: set[str] = set()
+    subreddits = []
+    for sub in discovered:
+        normalized_sub = normalize._normalized_subreddit_name(sub)
+        if normalized_sub and normalized_sub not in seen_subreddits and not normalize._is_excluded_reddit_subreddit(sub):
+            seen_subreddits.add(normalized_sub)
+            subreddits.append(str(sub))
+    subreddits = subreddits[:max_subreddits]
+    counters = {key: 0 for key in (
+        "subreddit_discovery_groups_processed", "subreddit_expansion_subreddits_selected",
+        "subreddit_expansion_primary_attempts", "subreddit_expansion_primary_usable",
+        "subreddit_expansion_primary_empty", "subreddit_expansion_primary_failed",
+        "subreddit_expansion_public_attempts", "subreddit_expansion_public_usable",
+        "subreddit_expansion_public_empty", "subreddit_expansion_public_failed",
+        "subreddit_expansion_public_fallbacks",
+    )}
+    counters["subreddit_discovery_groups_processed"] = 1
+    counters["subreddit_expansion_subreddits_selected"] = len(subreddits)
+    if not subreddits:
+        return [], counters
+    raw: list[dict[str, Any]] = []
+    token = config.get("SCRAPECREATORS_API_KEY")
+    for subreddit in subreddits:
+        primary_items: list[dict[str, Any]] = []
+        if token:
+            counters["subreddit_expansion_primary_attempts"] += 1
+            try:
+                primary_items = reddit.search_reddit_in_subreddits(expansion_query, [subreddit], depth=depth, token=token)
+                counters["subreddit_expansion_primary_usable" if primary_items else "subreddit_expansion_primary_empty"] += 1
+            except Exception:
+                counters["subreddit_expansion_primary_failed"] += 1
+        if primary_items:
+            raw.extend(primary_items)
+            continue
+        counters["subreddit_expansion_public_attempts"] += 1
+        if token:
+            counters["subreddit_expansion_public_fallbacks"] += 1
+        try:
+            public_items = reddit_keyless.search_public_in_subreddits(
+                expansion_query, [subreddit], from_date=from_date, to_date=to_date, depth=depth,
+            )
+            counters["subreddit_expansion_public_usable" if public_items else "subreddit_expansion_public_empty"] += 1
+            raw.extend(public_items)
+        except Exception:
+            counters["subreddit_expansion_public_failed"] += 1
+    for item in raw:
+        item["comment_enrichment_state"] = normalize.COMMENT_NOT_ENRICHED
+    expanded = _normalize_score_dedupe(
+        "reddit", raw, from_date, to_date, freshness_mode, representative.ranking_query,
+        comment_validation="deferred",
+    )
+    expansion_subquery = schema.SubQuery(
+        label=f"{group_id}-subreddit-expansion", group_id=group_id,
+        search_query=expansion_query, ranking_query=representative.ranking_query,
+        sources=["reddit"], weight=representative.weight,
+    )
+    for item in expanded:
+        _attach_subquery_provenance(item, expansion_subquery)
+        item.metadata["subreddit_expansion"] = True
+        item.metadata["expanded_subreddits"] = subreddits
+    return expanded, counters
 
 
 def _finalize_items_by_source(
@@ -3003,52 +3411,88 @@ def _finalize_items_by_source(
 def _cap_final_reddit_posts(
     ranked_candidates: list[schema.Candidate],
     items_by_source: dict[str, list[schema.SourceItem]],
+    *,
+    company_group_allocation: tuple[tuple[str, int], ...] | None = None,
 ) -> tuple[list[schema.Candidate], dict[str, list[schema.SourceItem]]]:
-    """Keep only the top ranked Reddit discussions in the final report.
+    """Keep only eligible Reddit discussions in the final report.
 
-    Reddit quality gates run before this point. The cap only truncates that
-    ranked survivor set; it never reintroduces excluded or commentless posts to
-    make up a quota, and leaves every non-Reddit source untouched.
+    The normal cap preserves the global ranking order.  Company ticker plans
+    instead reserve bounded slots in investment-group priority order while
+    retaining that ranking order within every group.
     """
+    assert not any(
+        item.source == "reddit" and item.metadata.get("comment_enrichment_state") == "not_enriched"
+        for candidate in ranked_candidates for item in candidate.source_items
+    ), "provisional Reddit evidence reached final selection"
+
     reddit_candidates = [
         candidate
         for candidate in ranked_candidates
         if (primary := schema.candidate_primary_item(candidate)) is not None
         and primary.source == "reddit"
     ]
-    if len(reddit_candidates) <= MAX_FINAL_REDDIT_POSTS:
+    if company_group_allocation:
+        selected: list[schema.Candidate] = []
+        selected_ids: set[str] = set()
+        for group_id, group_cap in company_group_allocation:
+            selected_for_group = 0
+            for candidate in reddit_candidates:
+                primary = schema.candidate_primary_item(candidate)
+                if len(selected) >= MAX_FINAL_REDDIT_POSTS or selected_for_group >= group_cap:
+                    break
+                if candidate.candidate_id in selected_ids or group_id not in (primary.metadata.get("group_ids") or []):
+                    continue
+                selected.append(candidate)
+                selected_ids.add(candidate.candidate_id)
+                selected_for_group += 1
+        kept_candidates = selected
+    elif len(reddit_candidates) <= MAX_FINAL_REDDIT_POSTS:
         return ranked_candidates, items_by_source
+    else:
+        kept_candidates = reddit_candidates[:MAX_FINAL_REDDIT_POSTS]
 
-    kept_candidates = reddit_candidates[:MAX_FINAL_REDDIT_POSTS]
     kept_candidate_ids = {candidate.candidate_id for candidate in kept_candidates}
-    kept_item_ids = {
-        primary.item_id
-        for candidate in kept_candidates
-        if (primary := schema.candidate_primary_item(candidate)) is not None
-    }
-    kept_urls = {
-        primary.url
-        for candidate in kept_candidates
-        if (primary := schema.candidate_primary_item(candidate)) is not None and primary.url
-    }
-    capped_candidates = [
-        candidate
-        for candidate in ranked_candidates
-        if not (
-            (primary := schema.candidate_primary_item(candidate)) is not None
-            and primary.source == "reddit"
-            and candidate.candidate_id not in kept_candidate_ids
-        )
-    ]
+    if company_group_allocation:
+        non_reddit_candidates = [
+            candidate
+            for candidate in ranked_candidates
+            if (primary := schema.candidate_primary_item(candidate)) is None or primary.source != "reddit"
+        ]
+        capped_candidates = [*kept_candidates, *non_reddit_candidates]
+    else:
+        capped_candidates = [
+            candidate
+            for candidate in ranked_candidates
+            if not (
+                (primary := schema.candidate_primary_item(candidate)) is not None
+                and primary.source == "reddit"
+                and candidate.candidate_id not in kept_candidate_ids
+            )
+        ]
     capped_items = dict(items_by_source)
-    capped_items["reddit"] = [
-        item
-        for item in items_by_source.get("reddit", [])
-        if item.item_id in kept_item_ids or (item.url and item.url in kept_urls)
-    ]
+    if company_group_allocation:
+        capped_items["reddit"] = [
+            primary
+            for candidate in kept_candidates
+            if (primary := schema.candidate_primary_item(candidate)) is not None
+        ]
+    else:
+        kept_item_ids = {
+            primary.item_id
+            for candidate in kept_candidates
+            if (primary := schema.candidate_primary_item(candidate)) is not None
+        }
+        kept_urls = {
+            primary.url
+            for candidate in kept_candidates
+            if (primary := schema.candidate_primary_item(candidate)) is not None and primary.url
+        }
+        capped_items["reddit"] = [
+            item
+            for item in items_by_source.get("reddit", [])
+            if item.item_id in kept_item_ids or (item.url and item.url in kept_urls)
+        ]
     return capped_candidates, capped_items
-
-
 def _merge_replayed_enrichment(
     items: list[schema.SourceItem],
     replayed: list[dict],
@@ -3775,6 +4219,16 @@ def _retrieve_reddit_stream(
     reddit_query = subquery.search_query or raw_topic or topic
     dedicated_subreddits = config.get("_dedicated_subreddits") or None
     has_sc_key = bool(config.get("SCRAPECREATORS_API_KEY"))
+    deferred_comments = config.get("_reddit_comment_enrichment_mode") == "deferred_company_wide"
+    group_scoped_expansion = config.get("_reddit_search_execution_mode") == "group_scoped_subreddit_expansion"
+    def diagnostics(primary_backend: str, *, primary_usable: bool = False, primary_empty: bool = False,
+                    primary_failed: bool = False, public_fallbacks: int = 0, accepted: int = 0) -> dict:
+        return {"reddit_search_diagnostics": {
+            "primary_backend": primary_backend, "primary_search_attempts": 1,
+            "primary_search_usable": int(primary_usable), "primary_search_empty": int(primary_empty),
+            "primary_search_failed": int(primary_failed), "public_fallback_invocations": public_fallbacks,
+            "accepted_record_count": accepted,
+        }}
     sc_first = (
         has_sc_key
         and (config.get(env.REDDIT_BACKEND_PIN_VAR) or "").lower()
@@ -3788,10 +4242,12 @@ def _retrieve_reddit_stream(
                 reddit_query, from_date, to_date, depth=depth,
                 token=config.get("SCRAPECREATORS_API_KEY"),
                 subreddits=subreddits,
+                comment_enrichment=not deferred_comments,
+                subreddit_expansion=not group_scoped_expansion,
             )
             items = reddit.parse_reddit_response(result)
             if items:
-                return items, {}
+                return items, diagnostics("scrapecreators", primary_usable=True, accepted=len(items))
             sys.stderr.write(
                 "[Reddit] ScrapeCreators primary returned no items, "
                 "using public fallback\n"
@@ -3807,16 +4263,20 @@ def _retrieve_reddit_stream(
             public_results = reddit_public.search_reddit_public(
                 reddit_query, from_date, to_date, depth=depth,
                 subreddits=subreddits,
+                comment_enrichment=not deferred_comments,
+                base_only=group_scoped_expansion,
             )
             if public_results:
                 if primary_failure is not None:
                     state = reddit.classify_run_failure(str(primary_failure))
-                    return public_results, _outcome_artifact(
+                    artifact = _outcome_artifact(
                         state,
                         f"Reddit primary failed; public fallback returned "
                         f"{len(public_results)} items: {primary_failure}",
                     )
-                return public_results, {}
+                    artifact.update(diagnostics("scrapecreators", primary_failed=True, public_fallbacks=1, accepted=len(public_results)))
+                    return public_results, artifact
+                return public_results, diagnostics("scrapecreators", primary_empty=True, public_fallbacks=1, accepted=len(public_results))
             sys.stderr.write(
                 "[Reddit] Public fallback returned no items after "
                 "ScrapeCreators primary miss\n"
@@ -3834,7 +4294,7 @@ def _retrieve_reddit_stream(
                 f"Reddit primary and fallback produced no results after failure: {failure}",
                 state,
             )
-        return [], {}
+        return [], diagnostics("scrapecreators", primary_empty=primary_failure is None, primary_failed=primary_failure is not None, public_fallbacks=1)
 
     # Default: public Reddit first (free). ScrapeCreators backfills when the
     # free path is empty OR returns fewer than the configured thinness floor
@@ -3850,6 +4310,8 @@ def _retrieve_reddit_stream(
         public_results = reddit_public.search_reddit_public(
             reddit_query, from_date, to_date, depth=depth,
             subreddits=subreddits, dedicated_subreddits=dedicated_subreddits,
+            comment_enrichment=not deferred_comments,
+            base_only=group_scoped_expansion,
         ) or []
     except Exception as exc:
         public_failure = exc
@@ -3865,7 +4327,7 @@ def _retrieve_reddit_stream(
     # 1) keeps the default (min_items=0) as empty-only AND treats exactly
     # `min_items` results as acceptable (no backfill) for min_items > 0.
     if len(public_results) >= max(min_items, 1) or not has_sc_key:
-        return public_results, {}
+        return public_results, diagnostics("public", primary_usable=bool(public_results), primary_empty=not bool(public_results), accepted=len(public_results))
     if public_results:
         sys.stderr.write(
             f"[Reddit] Free path returned {len(public_results)} "
@@ -3876,6 +4338,8 @@ def _retrieve_reddit_stream(
             reddit_query, from_date, to_date, depth=depth,
             token=config.get("SCRAPECREATORS_API_KEY"),
             subreddits=subreddits,
+            comment_enrichment=not deferred_comments,
+            subreddit_expansion=not group_scoped_expansion,
         )
         sc_items = reddit.parse_reddit_response(result)
     except Exception as exc:
@@ -3884,19 +4348,23 @@ def _retrieve_reddit_stream(
             f"({type(exc).__name__}: {exc})\n"
         )
         state = reddit.classify_run_failure(str(exc))
-        return public_results, _outcome_artifact(
+        artifact = _outcome_artifact(
             state,
             f"Reddit backup failed after {len(public_results)} public items: {exc}",
         )
+        artifact.update(diagnostics("public", primary_usable=bool(public_results), primary_empty=not bool(public_results), primary_failed=public_failure is not None, accepted=len(public_results)))
+        return public_results, artifact
     merged = _merge_reddit_items(public_results, sc_items)
     if public_failure is not None:
         state = reddit.classify_run_failure(str(public_failure))
-        return merged, _outcome_artifact(
+        artifact = _outcome_artifact(
             state,
             f"Reddit public search failed; backup returned {len(sc_items)} items: "
             f"{public_failure}",
         )
-    return merged, {}
+        artifact.update(diagnostics("public", primary_failed=True, accepted=len(merged)))
+        return merged, artifact
+    return merged, diagnostics("public", primary_usable=bool(public_results), primary_empty=not bool(public_results), accepted=len(merged))
 
 
 def _retrieve_stream(*args, **kwargs) -> tuple[list[dict], dict]:
@@ -3977,7 +4445,11 @@ def _retrieve_stream_impl(
         return [], {}
     from_date, to_date = date_range
     if mock:
-        return _mock_stream_results(source, subquery)
+        items, artifact = _mock_stream_results(source, subquery)
+        if source == "reddit" and config.get("_reddit_comment_enrichment_mode") == "deferred_company_wide":
+            for item in items:
+                item["comment_enrichment_state"] = "not_enriched"
+        return items, artifact
     if source == "grounding":
         return grounding.web_search(
             subquery.search_query, date_range, config, backend=web_backend)
