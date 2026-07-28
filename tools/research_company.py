@@ -220,38 +220,6 @@ def _validate_defaults(defaults: dict[str, Any], path: Path) -> None:
             raise ValueError(f"{path}: reddit_execution.{key} must be a positive integer")
 
 
-def _validate_company(config: dict[str, Any], path: Path, identifier: TickerIdentifier) -> None:
-    configured = normalize_ticker(_require_string(config, "ticker", path))
-    if configured.exchange_qualifier or configured.ticker != identifier.ticker or path.stem != identifier.ticker:
-        raise ValueError(f"{path}: ticker must match its configuration filename ({path.stem}.json)")
-    if identifier.exchange_qualifier and identifier.exchange_qualifier != _require_string(config, "exchange", path).upper():
-        raise ValueError(f"{path}: exchange qualifier does not match config exchange")
-    for key in ("company_name", "exchange", "market"):
-        _require_string(config, key, path)
-    if "legal_name" in config:
-        _require_string(config, "legal_name", path)
-    _require_string_list(config, "aliases", path)
-    _require_string_list(config, "products", path)
-    groups = config.get("search_groups")
-    if not isinstance(groups, list) or not groups:
-        raise ValueError(f"{path}: search_groups must be a non-empty list")
-    group_ids: set[str] = set()
-    for group in groups:
-        if not isinstance(group, dict):
-            raise ValueError(f"{path}: each search group must be an object")
-        group_id = _require_string(group, "id", path)
-        if group_id in group_ids:
-            raise ValueError(f"{path}: duplicate search group id {group_id!r}")
-        group_ids.add(group_id)
-        _require_string(group, "ranking_query", path)
-        queries = _require_string_list(group, "queries", path)
-        normalized_queries = [query.casefold() for query in queries]
-        if len(normalized_queries) != len(set(normalized_queries)):
-            raise ValueError(f"{path}: search group {group_id!r} has duplicate queries")
-    if "reddit" in config:
-        raise ValueError(f"{path}: company configs must not define Reddit policy")
-
-
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     merged = copy.deepcopy(base)
     for key, value in override.items():
@@ -260,13 +228,6 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         else:
             merged[key] = copy.deepcopy(value)
     return merged
-
-
-def load_company_config(identifier: TickerIdentifier) -> dict[str, Any]:
-    path = COMPANIES_DIR / f"{identifier.ticker}.json"
-    config = _read_object(path)
-    _validate_company(config, path, identifier)
-    return config
 
 
 def resolve_run(identifier: TickerIdentifier, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -279,7 +240,7 @@ def resolve_run(identifier: TickerIdentifier, overrides: dict[str, Any] | None =
         raise ValueError(f"could not discover company entities for {identity.company_name}")
     config = _deep_merge(defaults, {"company_name": identity.company_name, "exchange": identity.exchange or "", "market": identity.industry or "", "search_groups": _generic_groups(identity)})
     config = _deep_merge(config, {key: value for key, value in (overrides or {}).items() if value is not None})
-    return {"config": config, "identity": identity, "entities": entities, "defaults_path": DEFAULTS_PATH, "company_path": None, "reddit_policy": reddit_policy.load_policy(BLOCKLIST_PATH, PREFERENCES_PATH)}
+    return {"config": config, "identity": identity, "entities": entities, "defaults_path": DEFAULTS_PATH, "reddit_policy": reddit_policy.load_policy(BLOCKLIST_PATH, PREFERENCES_PATH)}
 
 def parse_as_of(value: str) -> date:
     try:
@@ -352,7 +313,6 @@ def complete_plan(identifier: TickerIdentifier, resolved: dict[str, Any], as_of:
         "market": config["market"],
         "date_range": {"from": start, "to": end, "days": days},
         "global_defaults_path": str(resolved["defaults_path"]),
-        "company_config_path": str(resolved["company_path"]),
         "sources": config["sources"],
         "intent": config["intent"],
         "freshness_mode": config["freshness_mode"],
@@ -452,7 +412,7 @@ def _write_metadata(plan: dict[str, Any], status: str, returncode: int | None, s
         "ticker": plan["ticker"], "company_name": plan["company_name"],
         "exchange": plan["exchange"], "market": plan["market"],
         "date_range": plan["date_range"],
-        "config_paths": {"global_defaults": plan["global_defaults_path"], "company": plan["company_config_path"]},
+        "config_paths": {"global_defaults": plan["global_defaults_path"]},
         "executed_search_groups": plan["resolved_search_groups"],
         "research_group_count": plan["research_group_count"],
         "configured_query_count": plan["configured_query_count"],

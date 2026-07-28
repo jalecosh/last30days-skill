@@ -24,6 +24,8 @@ def mock_company_identity_lookups(monkeypatch):
         "ADBE": ("Adobe Inc.", "Adobe Inc."),
         "ADSK": ("Autodesk, Inc.", "Autodesk, Inc."),
         "PTC": ("PTC Inc.", "PTC Inc."),
+        "ISRG": ("Intuitive Surgical, Inc.", "Intuitive Surgical, Inc."),
+        "SPGI": ("S&P Global Inc.", "S&P Global Inc."),
     }
 
     def yahoo(query):
@@ -55,11 +57,42 @@ def test_every_company_loads_the_same_global_blocklist(ticker):
 def test_generic_company_path_requires_no_company_config_file():
     resolved = _resolved("ADSK")
     plan = research_company.complete_plan(research_company.normalize_ticker("ADSK"), resolved, date(2026, 7, 26), 30)
-    assert resolved["company_path"] is None
-    assert plan["company_config_path"] == "None"
     assert plan["resolved_company_name"]
     assert plan["resolved_short_name"]
 
+
+def test_ticker_configs_cannot_affect_generic_plans(monkeypatch):
+    contradictory = "config/companies/ADBE.json"
+    reads: list[Path] = []
+    original_read_text = Path.read_text
+
+    def reject_company_config_reads(path, *args, **kwargs):
+        if path.as_posix().endswith(contradictory):
+            reads.append(path)
+            raise AssertionError("ticker-specific config must never be read")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", reject_company_config_reads)
+    plan = research_company.complete_plan(research_company.normalize_ticker("ADBE"), _resolved("ADBE"), date(2026, 7, 26), 30)
+    assert not reads
+    assert plan["research_group_count"] == 5
+    assert plan["query_scheduler"]["scheduled_query_count"] == 27
+    assert "Not Adobe" not in plan["engine_plan"]["reddit_entity_terms"]
+    assert "Not A Product" not in plan["engine_plan"]["reddit_entity_terms"]
+
+
+@pytest.mark.parametrize("ticker", ["ADBE", "ADSK", "ISRG", "SPGI"])
+def test_all_companies_use_the_same_generic_five_group_27_query_model(ticker):
+    resolved = _resolved(ticker)
+    plan = research_company.complete_plan(research_company.normalize_ticker(ticker), resolved, date(2026, 7, 26), 30)
+    assert [group["id"] for group in plan["resolved_search_groups"]] == [
+        "investment_and_valuation", "business_performance", "management_and_internal",
+        "competition_and_future", "customer_and_product_evidence",
+    ]
+    assert plan["research_group_count"] == 5
+    assert plan["query_scheduler"]["scheduled_query_count"] == 27
+    assert "company_config_path" not in plan
+    assert set(plan["engine_plan"]["reddit_entity_terms"]) <= set(resolved["entities"])
 
 def test_ticker_normalization_and_output_filenames_are_ticker_led():
     assert research_company.normalize_ticker("nasdaq:adbe").display == "NASDAQ:ADBE"
