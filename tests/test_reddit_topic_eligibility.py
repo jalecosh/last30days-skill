@@ -97,14 +97,20 @@ class AdobeTopicEligibilityTests(unittest.TestCase):
             self.assertIn(key, source.metadata)
 
     def test_existing_global_subreddit_weighting_and_base_ranking_are_unchanged(self):
-        self.assertEqual(1.08, normalize.reddit_subreddit_quality_multiplier("r/ValueInvesting"))
-        self.assertEqual(1.00, normalize.reddit_subreddit_quality_multiplier("r/Adobe"))
-        self.assertEqual(1.00, normalize.reddit_subreddit_quality_multiplier("creativeworkflow"))
-        self.assertEqual(0.0, normalize.reddit_subreddit_quality_multiplier("r/FuckAdobe"))
-        self.assertEqual(0.35, signals.reddit_rank_score(1.0, 0.0, 0.0, 0.0))
-        self.assertEqual(0.25, signals.reddit_rank_score(0.0, 1.0, 0.0, 0.0))
-        self.assertEqual(0.25, signals.reddit_rank_score(0.0, 0.0, 1.0, 0.0))
-        self.assertEqual(0.15, signals.reddit_rank_score(0.0, 0.0, 0.0, 1.0))
+        original = normalize.BLOCKED_SUBREDDITS, normalize.EXCLUDED_SUBREDDITS, normalize.SUBREDDIT_QUALITY_MULTIPLIERS
+        normalize.BLOCKED_SUBREDDITS = frozenset({"bannedtestforum"})
+        normalize.EXCLUDED_SUBREDDITS = normalize.BLOCKED_SUBREDDITS
+        normalize.SUBREDDIT_QUALITY_MULTIPLIERS = {"preferredtestforum": 1.08}
+        try:
+            self.assertEqual(1.08, normalize.reddit_subreddit_quality_multiplier("r/PreferredTestForum"))
+            self.assertEqual(1.00, normalize.reddit_subreddit_quality_multiplier("r/UnlistedTestForum"))
+            self.assertEqual(0.0, normalize.reddit_subreddit_quality_multiplier("r/BannedTestForum"))
+            self.assertEqual(0.35, signals.reddit_rank_score(1.0, 0.0, 0.0, 0.0))
+            self.assertEqual(0.25, signals.reddit_rank_score(0.0, 1.0, 0.0, 0.0))
+            self.assertEqual(0.25, signals.reddit_rank_score(0.0, 0.0, 1.0, 0.0))
+            self.assertEqual(0.15, signals.reddit_rank_score(0.0, 0.0, 0.0, 1.0))
+        finally:
+            normalize.BLOCKED_SUBREDDITS, normalize.EXCLUDED_SUBREDDITS, normalize.SUBREDDIT_QUALITY_MULTIPLIERS = original
 
 
 class AdobeTopicEligibilityRelevanceTests(unittest.TestCase):

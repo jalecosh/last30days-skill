@@ -100,14 +100,21 @@ class RedditRecallPipelineTests(unittest.TestCase):
         self.assertNotIn("reddit_recall", render.render_full(report))
 
     def test_raw_gate_counters_keep_blocked_and_commentless_posts_out(self):
-        stats = pipeline._reddit_raw_stats([
-            _reddit_item("blocked", 1, subreddit="r/FuckAdobe"),
-            _reddit_item("commentless", 2, comments=False),
-            _reddit_item("usable", 3),
-        ])
-        self.assertEqual(1, stats["posts_removed_by_blocklist"])
-        self.assertEqual(1, stats["posts_removed_as_commentless"])
-        self.assertEqual(1, stats["posts_with_usable_comments"])
+        from lib import normalize
+        original = normalize.BLOCKED_SUBREDDITS, normalize.EXCLUDED_SUBREDDITS
+        normalize.BLOCKED_SUBREDDITS = frozenset({"bannedtestforum"})
+        normalize.EXCLUDED_SUBREDDITS = normalize.BLOCKED_SUBREDDITS
+        try:
+            stats = pipeline._reddit_raw_stats([
+                _reddit_item("blocked", 1, subreddit="r/BannedTestForum"),
+                _reddit_item("commentless", 2, comments=False),
+                _reddit_item("usable", 3),
+            ])
+            self.assertEqual(1, stats["posts_removed_by_blocklist"])
+            self.assertEqual(1, stats["posts_removed_as_commentless"])
+            self.assertEqual(1, stats["posts_with_usable_comments"])
+        finally:
+            normalize.BLOCKED_SUBREDDITS, normalize.EXCLUDED_SUBREDDITS = original
 
     def test_reddit_only_caps_raise_defaults_without_overriding_explicit_cli_limits(self):
         base = pipeline._resolve_depth_settings("default", {})

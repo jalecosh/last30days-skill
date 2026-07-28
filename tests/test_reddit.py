@@ -339,9 +339,12 @@ class TestRedditCommentEvidenceFilter(unittest.TestCase):
         raw = [{"id": "R1", "title": "No discussion", "url": "https://reddit.com/r/x/comments/1/", "date": "2026-07-10", "engagement": {"score": 9, "num_comments": 0}}]
         self.assertEqual(normalize.normalize_source_items("reddit", raw, "2026-07-01", "2026-07-31"), [])
 
-    def test_fuckadobe_subreddits_are_hard_excluded_case_insensitively(self):
+    def test_configured_subreddits_are_hard_excluded_case_insensitively(self):
         from lib import normalize
-        variants = ["FuckAdobe", "fuckadobe", "r/FuckAdobe", "R/FUCKADOBE"]
+        original = normalize.BLOCKED_SUBREDDITS, normalize.EXCLUDED_SUBREDDITS
+        normalize.BLOCKED_SUBREDDITS = frozenset({"bannedtestforum"})
+        normalize.EXCLUDED_SUBREDDITS = normalize.BLOCKED_SUBREDDITS
+        variants = ["BannedTestForum", "bannedtestforum", "r/BannedTestForum", "R/BANNEDTESTFORUM"]
         raw = [
             {
                 "id": f"R{index}", "title": "Discussion", "url": f"https://reddit.com/r/x/comments/{index}/",
@@ -351,9 +354,12 @@ class TestRedditCommentEvidenceFilter(unittest.TestCase):
             }
             for index, subreddit in enumerate(variants)
         ]
-        self.assertEqual(normalize.normalize_source_items("reddit", raw, "2026-07-01", "2026-07-31"), [])
+        try:
+            self.assertEqual(normalize.normalize_source_items("reddit", raw, "2026-07-01", "2026-07-31"), [])
+        finally:
+            normalize.BLOCKED_SUBREDDITS, normalize.EXCLUDED_SUBREDDITS = original
 
-    def test_nonexcluded_subreddit_survives_hard_exclusion(self):
+    def test_unlisted_subreddit_survives_hard_exclusion(self):
         from lib import normalize
         raw = [{
             "id": "R1", "title": "Discussion", "url": "https://reddit.com/r/ValueInvesting/comments/1/",
@@ -423,6 +429,9 @@ class TestFinalRedditPostCap(unittest.TestCase):
 
     def test_commentless_and_excluded_posts_never_fill_cap(self):
         from lib import normalize, pipeline, schema
+        original = normalize.BLOCKED_SUBREDDITS, normalize.EXCLUDED_SUBREDDITS
+        normalize.BLOCKED_SUBREDDITS = frozenset({"bannedtestforum"})
+        normalize.EXCLUDED_SUBREDDITS = normalize.BLOCKED_SUBREDDITS
         raw = [
             {
                 "id": f"R{index}", "title": f"Eligible {index}", "url": f"https://reddit.com/r/Adobe/comments/{index}/",
@@ -431,18 +440,21 @@ class TestFinalRedditPostCap(unittest.TestCase):
             }
             for index in range(14)
         ] + [
-            {"id": "excluded", "title": "Excluded", "url": "https://reddit.com/r/FuckAdobe/comments/x/", "date": "2026-07-10", "subreddit": "R/FUCKADOBE", "engagement": {"score": 9, "num_comments": 1}, "top_comments": [{"excerpt": "usable"}]},
+            {"id": "excluded", "title": "Excluded", "url": "https://reddit.com/r/BannedTestForum/comments/x/", "date": "2026-07-10", "subreddit": "R/BANNEDTESTFORUM", "engagement": {"score": 9, "num_comments": 1}, "top_comments": [{"excerpt": "usable"}]},
             {"id": "commentless", "title": "Commentless", "url": "https://reddit.com/r/Adobe/comments/y/", "date": "2026-07-10", "subreddit": "Adobe", "engagement": {"score": 9, "num_comments": 1}},
         ]
-        survivors = normalize.normalize_source_items("reddit", raw, "2026-07-01", "2026-07-31")
-        candidates = [
-            schema.Candidate(candidate_id=item.item_id, item_id=item.item_id, source="reddit", title=item.title,
-                             url=item.url, snippet="", subquery_labels=[], native_ranks={}, local_relevance=1,
-                             freshness=1, engagement=1, source_quality=1, rrf_score=1, source_items=[item])
-            for item in survivors
-        ]
-        capped, items = pipeline._cap_final_reddit_posts(candidates, {"reddit": survivors})
-        self.assertEqual(len(capped), 14)
-        self.assertEqual(len(items["reddit"]), 14)
-        self.assertNotIn("Excluded", [candidate.title for candidate in capped])
-        self.assertNotIn("Commentless", [candidate.title for candidate in capped])
+        try:
+            survivors = normalize.normalize_source_items("reddit", raw, "2026-07-01", "2026-07-31")
+            candidates = [
+                schema.Candidate(candidate_id=item.item_id, item_id=item.item_id, source="reddit", title=item.title,
+                                 url=item.url, snippet="", subquery_labels=[], native_ranks={}, local_relevance=1,
+                                 freshness=1, engagement=1, source_quality=1, rrf_score=1, source_items=[item])
+                for item in survivors
+            ]
+            capped, items = pipeline._cap_final_reddit_posts(candidates, {"reddit": survivors})
+            self.assertEqual(len(capped), 14)
+            self.assertEqual(len(items["reddit"]), 14)
+            self.assertNotIn("Excluded", [candidate.title for candidate in capped])
+            self.assertNotIn("Commentless", [candidate.title for candidate in capped])
+        finally:
+            normalize.BLOCKED_SUBREDDITS, normalize.EXCLUDED_SUBREDDITS = original

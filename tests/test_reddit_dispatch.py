@@ -144,6 +144,30 @@ class TestEnvConstantParity:
         pub.assert_not_called()
         assert _ids(items) == ["z"]
 
+    def test_sc_primary_failure_uses_public_fallback(self):
+        cfg = {"SCRAPECREATORS_API_KEY": "k", env.REDDIT_BACKEND_PIN_VAR: "scrapecreators"}
+        with mock.patch("lib.reddit.search_and_enrich", side_effect=RuntimeError("down")) as sc, \
+             mock.patch("lib.reddit_public.search_reddit_public", return_value=[_item("public")]) as pub:
+            items, _ = pipeline._retrieve_stream(
+                topic="kanye", subquery=_subquery(), source="reddit", config=cfg,
+                depth="quick", date_range=("2026-05-26", "2026-06-25"), runtime=_runtime(), mock=False,
+            )
+        sc.assert_called_once()
+        pub.assert_called_once()
+        assert _ids(items) == ["public"]
+
+    def test_missing_key_uses_public_even_when_sc_is_configured(self):
+        cfg = {env.REDDIT_BACKEND_PIN_VAR: "scrapecreators"}
+        with mock.patch("lib.reddit.search_and_enrich") as sc, \
+             mock.patch("lib.reddit_public.search_reddit_public", return_value=[_item("public")]) as pub:
+            items, _ = pipeline._retrieve_stream(
+                topic="kanye", subquery=_subquery(), source="reddit", config=cfg,
+                depth="quick", date_range=("2026-05-26", "2026-06-25"), runtime=_runtime(), mock=False,
+            )
+        sc.assert_not_called()
+        pub.assert_called_once()
+        assert _ids(items) == ["public"]
+
     def test_min_items_constant_drives_thinness_backfill(self):
         # Keyed via the env constant: floor of 5 vs 1 free item -> SC backfill.
         cfg = {"SCRAPECREATORS_API_KEY": "k", env.REDDIT_SC_MIN_ITEMS_VAR: "5"}
