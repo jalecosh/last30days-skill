@@ -35,7 +35,15 @@ _PRIVATE_CORPUS_BLOCK = re.compile(
 )
 
 
+def resolve_library_db() -> Path:
+    """Return the configured shared library index path."""
+    raw_override = os.environ.get("LAST30DAYS_LIBRARY_DB", "").strip()
+    if raw_override:
+        return Path(raw_override).expanduser()
+    return DEFAULT_LIBRARY_DB
+
 class LibrarySearchUnavailable(RuntimeError):
+
     """Raised when this Python SQLite build cannot provide FTS5."""
 
 
@@ -102,14 +110,16 @@ def sync_library(
     memory_dir: Path | str = library.DEFAULT_MEMORY_DIR,
     briefs_dir: Path | str = library.DEFAULT_BRIEFS_DIR,
     *,
-    db_path: Path | str = DEFAULT_LIBRARY_DB,
+    db_path: Path | str | None = None,
 ) -> SyncResult:
     """Incrementally index the shared ``scan_library`` view of saved research."""
     if not fts5_available():
         raise LibrarySearchUnavailable(
             "library search requires a Python SQLite build with FTS5 support"
         )
-    target = Path(db_path).expanduser()
+    target = (
+        Path(db_path).expanduser() if db_path is not None else resolve_library_db()
+    )
     try:
         return _sync_library(memory_dir, briefs_dir, target)
     except sqlite3.DatabaseError as exc:
@@ -126,7 +136,7 @@ def sync_library(
 def index_brief(
     path: Path | str,
     *,
-    db_path: Path | str = DEFAULT_LIBRARY_DB,
+    db_path: Path | str | None = None,
 ) -> bool:
     """Index one saved artifact, parsing it through ``scan_library``."""
     source = Path(path).expanduser().resolve()
@@ -137,7 +147,9 @@ def index_brief(
     entry = next((item for item in entries if item.source_path.resolve() == source), None)
     if entry is None:
         return False
-    target = Path(db_path).expanduser()
+    target = (
+        Path(db_path).expanduser() if db_path is not None else resolve_library_db()
+    )
     _ensure_private_directory(target.parent)
     with _connect(target) as conn:
         _upsert_entry(conn, entry)
@@ -149,14 +161,16 @@ def search(
     query: str,
     *,
     limit: int = 20,
-    db_path: Path | str = DEFAULT_LIBRARY_DB,
+    db_path: Path | str | None = None,
     store_db_path: Path | str = DEFAULT_STORE_DB,
 ) -> list[LibrarySearchMatch]:
     """Search indexed briefs plus dated per-run findings from the research store."""
     expression = _fts_expression(query)
     if not expression or limit <= 0:
         return []
-    target = Path(db_path).expanduser()
+    target = (
+        Path(db_path).expanduser() if db_path is not None else resolve_library_db()
+    )
     brief_matches: list[LibrarySearchMatch] = []
     if target.is_file():
         try:
@@ -197,7 +211,7 @@ def sync_and_search(
     *,
     memory_dir: Path | str = library.DEFAULT_MEMORY_DIR,
     briefs_dir: Path | str = library.DEFAULT_BRIEFS_DIR,
-    db_path: Path | str = DEFAULT_LIBRARY_DB,
+    db_path: Path | str | None = None,
     store_db_path: Path | str = DEFAULT_STORE_DB,
     limit: int = 20,
 ) -> tuple[list[LibrarySearchMatch], SyncResult]:

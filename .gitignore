@@ -57,3 +57,4 @@ output/
 # Python runtime cache
 __pycache__/
 *.py[cod]
+.last30days/

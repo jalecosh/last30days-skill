@@ -1949,7 +1949,7 @@ def _load_library_context(
         db_path = (
             Path(memory_dir).expanduser().resolve() / ".last30days-library.db"
             if save_dir is not None
-            else library_index.DEFAULT_LIBRARY_DB
+            else library_index.resolve_library_db()
         )
     store_db = config.get("_LAST30DAYS_STORE_DB")
     if not store_db:
@@ -2570,10 +2570,12 @@ def run(
         if plan.reddit_entity_terms:
             provisional_unique = [
                 item for item in provisional_unique
-                if matches_company_entity(
+                if matches_company_reddit_title(
                     item.title,
                     item.metadata.get("reddit_post_body"),
                     plan.reddit_entity_terms,
+                    plan.raw_topic,
+                    item.container,
                 )
             ]
         before = len(provisional_reddit_items)
@@ -3188,6 +3190,33 @@ def matches_company_entity(title: str, body: str, entities: list[str]) -> bool:
         if re.search(pattern, title_text):
             return True
     return False
+
+
+def is_finance_weighted_subreddit(subreddit: str) -> bool:
+    """Whether a subreddit has the configured finance/investment weight."""
+    return math.isclose(normalize.reddit_subreddit_quality_multiplier(subreddit), 1.5)
+
+
+def matches_exact_ticker_title(title: str, ticker: str) -> bool:
+    """Match a complete, case-insensitive ticker token in a Reddit title."""
+    normalized_ticker = normalize_company_entity(ticker)
+    if not normalized_ticker:
+        return False
+    return bool(re.search(
+        r"(?<!\w)" + re.escape(normalized_ticker) + r"(?!\w)",
+        " ".join(str(title or "").casefold().split()),
+    ))
+
+
+def matches_company_reddit_title(
+    title: str, body: str, entities: list[str], ticker: str, subreddit: str,
+) -> bool:
+    """Apply company title eligibility, with ticker support in weighted finance forums."""
+    return matches_company_entity(title, body, entities) or (
+        is_finance_weighted_subreddit(subreddit)
+        and matches_exact_ticker_title(title, ticker)
+    )
+
 
 def _select_provisional_reddit_items(
     items: list[schema.SourceItem], budget: int, group_order: list[str],

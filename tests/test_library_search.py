@@ -710,3 +710,71 @@ def test_markdown_save_to_scoped_dir_syncs_a_scoped_index(tmp_path):
         scoped_root / "briefings",
         db_path=scoped_root / ".last30days-library.db",
     )
+
+
+def test_resolve_library_db_uses_default_when_override_is_unset(tmp_path, monkeypatch):
+    default = tmp_path / "default-library.db"
+    monkeypatch.delenv("LAST30DAYS_LIBRARY_DB", raising=False)
+    monkeypatch.setattr(library_index, "DEFAULT_LIBRARY_DB", default)
+
+    assert library_index.resolve_library_db() == default
+
+
+def test_resolve_library_db_uses_trimmed_override_and_expands_home(tmp_path, monkeypatch):
+    override = tmp_path / "custom-library.db"
+    monkeypatch.setenv("LAST30DAYS_LIBRARY_DB", f"  {override}  ")
+    assert library_index.resolve_library_db() == override
+
+    home_override = Path.home() / ".last30days-test-library.db"
+    monkeypatch.setenv("LAST30DAYS_LIBRARY_DB", "  ~/.last30days-test-library.db  ")
+    assert library_index.resolve_library_db() == home_override
+
+
+def test_library_defaults_read_from_environment_override(tmp_path, monkeypatch):
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    _write_report(
+        memory,
+        name="topic-raw.md",
+        topic="Override topic",
+        date="2026-07-01",
+        headline="Override database remains searchable",
+        evidence="The temporary SQLite database stores this library evidence.",
+    )
+    override = tmp_path / "nested" / "library.db"
+    monkeypatch.setenv("LAST30DAYS_LIBRARY_DB", str(override))
+
+    library_index.sync_library(memory, tmp_path / "briefs")
+    matches = library_index.search(
+        "temporary SQLite", store_db_path=tmp_path / "missing-store.db"
+    )
+
+    assert override.is_file()
+    assert [match.topic for match in matches] == ["Override topic"]
+
+
+def test_inaccessible_library_override_is_reported_without_default_fallback(
+    tmp_path, monkeypatch
+):
+    override = tmp_path / "unavailable" / "library.db"
+    monkeypatch.setenv("LAST30DAYS_LIBRARY_DB", str(override))
+    sync = mock.Mock(side_effect=PermissionError("access denied"))
+    monkeypatch.setattr(library_index, "sync_library", sync)
+
+    context, warning = pipeline._load_library_context(
+        topic="MCP servers",
+        config={
+            "LAST30DAYS_LIBRARY_CONTEXT": "on",
+            "LAST30DAYS_MEMORY_DIR": str(tmp_path),
+        },
+        mock=False,
+        internal_subrun=False,
+        x_handle=None,
+        github_user=None,
+        github_repos=None,
+    )
+
+    assert context == []
+    assert warning == "Library context unavailable: access denied"
+    assert Path(sync.call_args.kwargs["db_path"]) == override
+    assert Path(sync.call_args.kwargs["db_path"]) != library_index.DEFAULT_LIBRARY_DB
