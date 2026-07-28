@@ -2549,7 +2549,7 @@ def run(
                 bundle.artifacts.setdefault("grounding", []).append(artifact)
 
     if plan.reddit_comment_enrichment_mode == "deferred_company_wide":
-        if plan.reddit_search_execution_mode == "group_scoped_subreddit_expansion":
+        if not plan.reddit_entity_terms and plan.reddit_search_execution_mode == "group_scoped_subreddit_expansion":
             search_counters = bundle.artifacts["reddit_group_search"]
             group_order = list(dict.fromkeys(subquery.group_id for subquery in plan.subqueries if subquery.group_id))
             for group_id in group_order:
