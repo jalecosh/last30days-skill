@@ -332,7 +332,10 @@ def build_engine_plan(resolved: dict[str, Any]) -> tuple[dict[str, Any], list[di
         "reddit_max_discovered_subreddits_per_group": budget["max_discovered_subreddits_per_group"],
         "reddit_max_subreddit_expansion_requests_per_group": budget["max_subreddit_expansion_requests_per_group"],
         "preserve_all_subqueries": True,
-        "company_query_budget": budget["max_queries_per_company"], "reddit_entity_terms": resolved["entities"],
+        "company_query_budget": budget["max_queries_per_company"],
+        "reddit_entity_terms": engine_pipeline.company_title_eligibility_entities(
+            resolved["entities"], resolved["identity"].ticker,
+        ),
         "subqueries": subqueries,
     }, queries, {"strategy": "deterministic_round_robin", **budget, "configured_query_count": sum(len(group["queries"]) for group in groups), "scheduled_query_count": len(queries), "skipped_query_count": len(schedule["skipped"]), "submission_order": [query["label"] for query in queries], "skipped_queries": schedule["skipped"]}
 

@@ -3155,11 +3155,25 @@ _GENERIC_COMPANY_ENTITY_TERMS = frozenset({
 })
 
 
+def normalize_company_entity(entity: str) -> str:
+    """Normalize a company entity for exact eligibility comparisons."""
+    return " ".join(str(entity or "").casefold().split())
+
+
+def company_title_eligibility_entities(entities: list[str], ticker: str) -> list[str]:
+    """Keep validated entities except the exact bare ticker for title matching."""
+    normalized_ticker = normalize_company_entity(ticker)
+    return [
+        entity for entity in entities
+        if normalize_company_entity(entity) != normalized_ticker
+    ]
+
+
 def matches_company_entity(title: str, body: str, entities: list[str]) -> bool:
     """Match a validated company entity in a Reddit title."""
     normalized_entities = []
     for entity in entities:
-        normalized = " ".join(str(entity or "").casefold().split())
+        normalized = normalize_company_entity(entity)
         if normalized and normalized not in _GENERIC_COMPANY_ENTITY_TERMS and normalized not in normalized_entities:
             normalized_entities.append(normalized)
     normalized_entities.sort(key=lambda value: (len(value.split()), len(value)))
