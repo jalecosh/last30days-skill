@@ -2574,7 +2574,7 @@ def _run_library_search(
             ),
             db_path=(
                 memory_dir.resolve() / ".last30days-library.db"
-                if args.save_dir else library_index.DEFAULT_LIBRARY_DB
+                if args.save_dir else library_index.resolve_library_db()
             ),
             # A scoped search must never merge in the shared store: one
             # client's sightings would leak into another client's scope. A

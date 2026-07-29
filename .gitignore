@@ -58,3 +58,7 @@ output/
 __pycache__/
 *.py[cod]
 .last30days/
+
+# InvestmentBrain local runtime data
+.last30days/
+.test-tmp/

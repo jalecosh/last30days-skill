@@ -1,12 +1,25 @@
 """Focused title-only eligibility tests for company Reddit candidates."""
 
-from lib import pipeline
+import pytest
+
+from lib import normalize, pipeline
 
 
 ENTITIES = [
     "Autodesk", "Autodesk, Inc.", "AutoCAD", "Revit", "Fusion 360",
     "Maya", "3ds Max", "Autodesk Forma",
 ]
+
+@pytest.fixture(autouse=True)
+def configured_finance_weights(monkeypatch):
+    monkeypatch.setattr(normalize, "SUBREDDIT_QUALITY_MULTIPLIERS", {
+        "finance": 1.5,
+        "stocks": 1.5,
+        "investing": 1.5,
+        "securityanalysis": 1.5,
+        "valueinvesting": 1.5,
+    })
+
 
 
 def matches(title="", body=""):
@@ -126,3 +139,54 @@ def test_adsk_and_adbe_company_title_eligibility_remain_valid():
         "Adobe valuation", "",
         pipeline.company_title_eligibility_entities(["ADBE", "Adobe"], "ADBE"),
     )
+
+
+def company_reddit_matches(title="", body="", *, ticker="PTC", subreddit="investing"):
+    return pipeline.matches_company_reddit_title(
+        title, body, pipeline.company_title_eligibility_entities(PTC_ENTITIES, ticker), ticker, subreddit,
+    )
+
+
+def test_finance_weighted_subreddit_allows_exact_ticker_title():
+    assert company_reddit_matches("PTC earnings discussion")
+
+
+def test_finance_weighted_subreddit_allows_dollar_ticker_title():
+    assert company_reddit_matches("$PTC valuation")
+
+
+def test_finance_weighted_subreddit_allows_exchange_qualified_ticker_title():
+    assert company_reddit_matches("NASDAQ:PTC earnings")
+
+
+def test_finance_weighted_subreddit_allows_lowercase_ticker_title():
+    assert company_reddit_matches("ptc earnings discussion")
+
+
+def test_finance_weighted_subreddit_rejects_ticker_substrings():
+    for title in ("catalyst outlook", "education update", "copycat valuation"):
+        assert not company_reddit_matches(title, ticker="CAT")
+
+
+def test_non_finance_subreddit_rejects_exact_ticker_only_title():
+    assert not company_reddit_matches("PTC earnings discussion", subreddit="PokemonGoAccounts")
+
+
+def test_non_finance_subreddit_keeps_non_ticker_entity_eligibility():
+    assert company_reddit_matches("Windchill deployment outlook", subreddit="technicalsupport")
+
+
+def test_comments_and_body_tickers_do_not_establish_company_eligibility():
+    assert not company_reddit_matches("General market discussion", "PTC earnings are soon")
+    assert not company_reddit_matches("General market discussion", "comment: $PTC is undervalued")
+
+
+def test_finance_subreddit_exception_is_derived_from_existing_weighting_configuration(monkeypatch):
+    monkeypatch.setattr(normalize, "SUBREDDIT_QUALITY_MULTIPLIERS", {"customfinance": 1.5})
+    assert pipeline.is_finance_weighted_subreddit("CustomFinance")
+    assert not pipeline.is_finance_weighted_subreddit("investing")
+
+
+def test_unknown_subreddit_has_default_weight_and_no_ticker_exception():
+    assert normalize.reddit_subreddit_quality_multiplier("UnknownForum") == 1.0
+    assert not company_reddit_matches("PTC earnings", subreddit="UnknownForum")

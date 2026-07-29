@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from lib import pipeline
+from lib import normalize, pipeline
 
 
 def _plan(*, entity_terms: list[str]) -> dict:
@@ -25,17 +25,17 @@ def _plan(*, entity_terms: list[str]) -> dict:
     }
 
 
-def _post(title: str) -> dict:
+def _post(title: str, *, subreddit: str = "test") -> dict:
     return {
         "id": title, "title": title, "selftext": "discussion",
         "url": f"https://reddit.com/r/test/comments/{title}/post/", "date": "2026-07-20",
-        "subreddit": "test", "relevance": 0.9,
+        "subreddit": subreddit, "relevance": 0.9,
         "engagement": {"score": 10, "num_comments": 2},
         "top_comments": [{"author": "reader", "excerpt": "usable", "score": 1}],
     }
 
 
-def _run(plan: dict, raw: list[dict]):
+def _run(plan: dict, raw: list[dict], *, topic: str = "Autodesk"):
     def enrich(items, **_kwargs):
         return items, {"posts_skipped_by_comment_tree_budget": 0}
 
@@ -45,7 +45,7 @@ def _run(plan: dict, raw: list[dict]):
          patch("lib.pipeline._run_supplemental_searches"), \
          patch("lib.pipeline._load_library_context", return_value=(None, None)):
         return pipeline.run(
-            topic="Autodesk", config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+            topic=topic, config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
             depth="default", requested_sources=["reddit"], mock=True, external_plan=plan,
         )
 
@@ -57,7 +57,22 @@ def test_company_plan_skips_expansion_and_keeps_title_eligible_base_candidate() 
     assert [item.title for item in report.items_by_source["reddit"]] == ["Autodesk valuation"]
 
 
-def test_non_company_group_plan_still_expands() -> None:
+def test_non_company_group_plan_still_expands_without_company_title_gate() -> None:
     with patch("lib.pipeline.expand_group_reddit_subreddits", return_value=([], {})) as expand:
-        _run(_plan(entity_terms=[]), [_post("Autodesk valuation")])
+        report = _run(_plan(entity_terms=[]), [_post("PTC earnings discussion")])
     expand.assert_called_once()
+    assert [item.title for item in report.items_by_source["reddit"]] == ["PTC earnings discussion"]
+
+
+
+def test_finance_ticker_title_enters_company_candidate_pool_without_expansion() -> None:
+    plan = _plan(entity_terms=pipeline.company_title_eligibility_entities(
+        ["PTC", "PTC Inc.", "Windchill"], "PTC",
+    ))
+    plan["subqueries"][0]["search_query"] = "PTC valuation"
+    plan["subqueries"][0]["ranking_query"] = "PTC valuation"
+    with patch.object(normalize, "SUBREDDIT_QUALITY_MULTIPLIERS", {"valueinvesting": 1.5}), \
+         patch("lib.pipeline.expand_group_reddit_subreddits") as expand:
+        report = _run(plan, [_post("PTC earnings discussion", subreddit="ValueInvesting")], topic="PTC")
+    expand.assert_not_called()
+    assert [item.title for item in report.items_by_source["reddit"]] == ["PTC earnings discussion"]
