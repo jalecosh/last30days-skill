@@ -146,7 +146,7 @@ def apply_adobe_reddit_relevance(item: schema.SourceItem) -> None:
         float(item.metadata.get("reddit_normalized_comments") or 0.0),
         float(item.metadata.get("reddit_normalized_post_score") or 0.0),
     )
-    item.local_rank_score = base_score * normalizer.reddit_subreddit_quality_multiplier(item.container)
+    item.local_rank_score = base_score
 
 
 def _top_comment_score(item: schema.SourceItem) -> float:
@@ -364,9 +364,7 @@ def annotate_stream(
                 normalized_comments,
                 normalized_post_score,
             )
-            multiplier = normalizer.reddit_subreddit_quality_multiplier(item.container)
-            item.metadata["reddit_subreddit_quality_multiplier"] = multiplier
-            item.local_rank_score = base_score * multiplier
+            item.local_rank_score = base_score
         else:
             item.local_rank_score = (
                 0.65 * item.local_relevance

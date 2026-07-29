@@ -1,10 +1,17 @@
 {
   "version": 1,
-  "preferred_subreddits": {
-    "finance": 1.5,
-    "stocks": 1.5,
-    "investing": 1.5,
-    "SecurityAnalysis": 1.5,
-    "ValueInvesting": 1.5
-  }
+  "preferred_subreddits": [
+    "finance",
+    "stocks",
+    "investing",
+    "SecurityAnalysis",
+    "ValueInvesting",
+    "StockMarket",
+    "personalfinance",
+    "trading",
+    "dividends",
+    "options",
+    "daytrading",
+    "Bogleheads"
+  ]
 }

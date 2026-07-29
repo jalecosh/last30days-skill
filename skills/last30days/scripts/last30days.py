@@ -2236,6 +2236,8 @@ def build_run_summary(report: schema.Report) -> dict[str, object]:
         "provisional_reddit_records_before_deduplication": statistics.get("provisional_reddit_records_before_deduplication"),
         "provisional_unique_reddit_posts_after_deduplication": statistics.get("provisional_unique_reddit_posts_after_deduplication"),
         "provisional_duplicate_records_merged": statistics.get("provisional_duplicate_records_merged"),
+        "company_gate_accepted": statistics.get("company_gate_accepted"),
+        "company_gate_rejected": statistics.get("company_gate_rejected"),
         "posts_pending_comment_enrichment": statistics.get("posts_pending_comment_enrichment"),
         "comment_enrichment": enrichment,
         "reddit_group_search": group_search,

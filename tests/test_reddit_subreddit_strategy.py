@@ -10,13 +10,13 @@ from lib import normalize, reddit, reddit_policy, schema, signals
 
 class RedditSubredditStrategyTests(unittest.TestCase):
     def setUp(self):
-        self.original = (normalize.BLOCKED_SUBREDDITS, normalize.EXCLUDED_SUBREDDITS, normalize.SUBREDDIT_QUALITY_MULTIPLIERS)
+        self.original = (normalize.BLOCKED_SUBREDDITS, normalize.EXCLUDED_SUBREDDITS, normalize.PREFERRED_SUBREDDITS)
         normalize.BLOCKED_SUBREDDITS = frozenset({"bannedtestforum"})
         normalize.EXCLUDED_SUBREDDITS = normalize.BLOCKED_SUBREDDITS
-        normalize.SUBREDDIT_QUALITY_MULTIPLIERS = {"preferredtestforum": 1.08}
+        normalize.PREFERRED_SUBREDDITS = {"preferredtestforum"}
 
     def tearDown(self):
-        normalize.BLOCKED_SUBREDDITS, normalize.EXCLUDED_SUBREDDITS, normalize.SUBREDDIT_QUALITY_MULTIPLIERS = self.original
+        normalize.BLOCKED_SUBREDDITS, normalize.EXCLUDED_SUBREDDITS, normalize.PREFERRED_SUBREDDITS = self.original
 
     def _raw(self, subreddit: str) -> dict:
         return {
@@ -42,8 +42,12 @@ class RedditSubredditStrategyTests(unittest.TestCase):
     def test_preference_is_secondary_to_unchanged_four_signal_formula(self):
         base = signals.reddit_rank_score(0.8, 0.7, 0.6, 0.5)
         self.assertAlmostEqual(base, 0.35 * 0.8 + 0.25 * 0.7 + 0.25 * 0.6 + 0.15 * 0.5)
-        self.assertAlmostEqual(normalize.reddit_subreddit_quality_multiplier("PreferredTestForum"), 1.08)
+        self.assertAlmostEqual(normalize.reddit_subreddit_quality_multiplier("PreferredTestForum"), 1.5)
         self.assertEqual(normalize.reddit_subreddit_quality_multiplier("UnlistedTestForum"), 1.0)
+
+    def test_missing_preferences_configuration_has_no_hidden_default(self):
+        policy = reddit_policy.load_policy()
+        self.assertEqual(frozenset(), policy.preferred_subreddits)
 
     def test_duplicate_block_entries_are_rejected_by_policy_loader(self):
         with patch.object(reddit_policy, "_read_object", return_value={"version": 1, "blocked_subreddits": ["r/DuplicateTestForum", "duplicatetestforum"]}):

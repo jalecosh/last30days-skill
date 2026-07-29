@@ -11,13 +11,9 @@ ENTITIES = [
 ]
 
 @pytest.fixture(autouse=True)
-def configured_finance_weights(monkeypatch):
-    monkeypatch.setattr(normalize, "SUBREDDIT_QUALITY_MULTIPLIERS", {
-        "finance": 1.5,
-        "stocks": 1.5,
-        "investing": 1.5,
-        "securityanalysis": 1.5,
-        "valueinvesting": 1.5,
+def configured_preferred_subreddits(monkeypatch):
+    monkeypatch.setattr(normalize, "PREFERRED_SUBREDDITS", {
+        "finance", "stocks", "investing", "securityanalysis", "valueinvesting",
     })
 
 
@@ -147,23 +143,23 @@ def company_reddit_matches(title="", body="", *, ticker="PTC", subreddit="invest
     )
 
 
-def test_finance_weighted_subreddit_allows_exact_ticker_title():
+def test_preferred_subreddit_allows_exact_ticker_title():
     assert company_reddit_matches("PTC earnings discussion")
 
 
-def test_finance_weighted_subreddit_allows_dollar_ticker_title():
+def test_preferred_subreddit_allows_dollar_ticker_title():
     assert company_reddit_matches("$PTC valuation")
 
 
-def test_finance_weighted_subreddit_allows_exchange_qualified_ticker_title():
+def test_preferred_subreddit_allows_exchange_qualified_ticker_title():
     assert company_reddit_matches("NASDAQ:PTC earnings")
 
 
-def test_finance_weighted_subreddit_allows_lowercase_ticker_title():
+def test_preferred_subreddit_allows_lowercase_ticker_title():
     assert company_reddit_matches("ptc earnings discussion")
 
 
-def test_finance_weighted_subreddit_rejects_ticker_substrings():
+def test_preferred_subreddit_rejects_ticker_substrings():
     for title in ("catalyst outlook", "education update", "copycat valuation"):
         assert not company_reddit_matches(title, ticker="CAT")
 
@@ -181,10 +177,10 @@ def test_comments_and_body_tickers_do_not_establish_company_eligibility():
     assert not company_reddit_matches("General market discussion", "comment: $PTC is undervalued")
 
 
-def test_finance_subreddit_exception_is_derived_from_existing_weighting_configuration(monkeypatch):
-    monkeypatch.setattr(normalize, "SUBREDDIT_QUALITY_MULTIPLIERS", {"customfinance": 1.5})
-    assert pipeline.is_finance_weighted_subreddit("CustomFinance")
-    assert not pipeline.is_finance_weighted_subreddit("investing")
+def test_preferred_subreddit_matching_is_case_insensitive(monkeypatch):
+    monkeypatch.setattr(normalize, "PREFERRED_SUBREDDITS", {"customfinance"})
+    assert company_reddit_matches("PTC earnings", subreddit="r/CustomFinance")
+    assert not company_reddit_matches("PTC earnings", subreddit="investing")
 
 
 def test_unknown_subreddit_has_default_weight_and_no_ticker_exception():

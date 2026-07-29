@@ -52,6 +52,9 @@ class SubQuery:
     sources: list[str]
     weight: float = 1.0
     group_id: str | None = None
+    # An explicit Reddit-only lane.  Unlike the general ``subreddits`` CLI
+    # context, this is a fixed retrieval target owned by the plan.
+    reddit_target_subreddits: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.sources:
@@ -424,6 +427,10 @@ def subquery_from_dict(payload: dict[str, Any]) -> SubQuery:
         sources=list(payload.get("sources") or []),
         weight=float(payload.get("weight") or 1.0),
         group_id=payload.get("group_id") if isinstance(payload.get("group_id"), str) else None,
+        reddit_target_subreddits=[
+            item for item in payload.get("reddit_target_subreddits", [])
+            if isinstance(item, str) and item.strip()
+        ],
     )
 
 

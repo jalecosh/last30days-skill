@@ -257,7 +257,7 @@ def result_paths(ticker: str, output_directory: str, as_of: date, days: int) -> 
 
 
 def build_engine_plan(resolved: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, str]], dict[str, Any]]:
-    """Expand each explicit query into an engine subquery without narrowing Reddit."""
+    """Plan global company queries plus one fixed ticker search per preferred subreddit."""
     config = resolved["config"]
     groups: list[dict[str, Any]] = []
     for group in config["search_groups"]:
@@ -283,6 +283,25 @@ def build_engine_plan(resolved: dict[str, Any]) -> tuple[dict[str, Any], list[di
         "ranking_query": group_by_id[query["group_id"]]["ranking_query"], "sources": config["sources"],
         "weight": group_by_id[query["group_id"]]["weight"],
     } for query in queries]
+    # Preferred communities are the sole source for this targeted lane.  Each
+    # gets exactly one native ticker search; the 27 global company queries are
+    # unchanged and are never multiplied by these communities.
+    policy = resolved.get("reddit_policy")
+    preferred_subreddits = sorted(policy.preferred_subreddits) if policy else []
+    targeted_queries = [
+        {
+            "label": f"preferred-subreddit-{subreddit}",
+            "group_id": "preferred_subreddit_ticker",
+            "query": resolved["identity"].ticker,
+            "reddit_target_subreddits": [subreddit],
+        }
+        for subreddit in preferred_subreddits
+    ]
+    subqueries.extend({
+        "label": query["label"], "group_id": query["group_id"], "search_query": query["query"],
+        "ranking_query": query["query"], "sources": ["reddit"], "weight": 1.0,
+        "reddit_target_subreddits": query["reddit_target_subreddits"],
+    } for query in targeted_queries)
     return {
         "intent": config["intent"],
         "freshness_mode": config["freshness_mode"],
@@ -298,7 +317,7 @@ def build_engine_plan(resolved: dict[str, Any]) -> tuple[dict[str, Any], list[di
             resolved["entities"], resolved["identity"].ticker,
         ),
         "subqueries": subqueries,
-    }, queries, {"strategy": "deterministic_round_robin", **budget, "configured_query_count": sum(len(group["queries"]) for group in groups), "scheduled_query_count": len(queries), "skipped_query_count": len(schedule["skipped"]), "submission_order": [query["label"] for query in queries], "skipped_queries": schedule["skipped"]}
+    }, queries + targeted_queries, {"strategy": "deterministic_round_robin", **budget, "configured_query_count": sum(len(group["queries"]) for group in groups), "scheduled_query_count": len(queries), "targeted_preferred_subreddit_query_count": len(targeted_queries), "skipped_query_count": len(schedule["skipped"]), "submission_order": [query["label"] for query in queries + targeted_queries], "skipped_queries": schedule["skipped"]}
 
 
 def complete_plan(identifier: TickerIdentifier, resolved: dict[str, Any], as_of: date, days: int) -> dict[str, Any]:
@@ -326,7 +345,7 @@ def complete_plan(identifier: TickerIdentifier, resolved: dict[str, Any], as_of:
         "global_reddit_preferences": {
             "path": policy.preferences_path,
             "version": policy.preferences_version,
-            "preferred_subreddits": policy.preferred_subreddits,
+            "preferred_subreddits": sorted(policy.preferred_subreddits),
         },
         "resolved_search_groups": config["search_groups"],
         "research_group_count": len(config["search_groups"]),
@@ -338,7 +357,6 @@ def complete_plan(identifier: TickerIdentifier, resolved: dict[str, Any], as_of:
         "queries": queries,
         "query_scheduler": scheduler,
         "search_execution_mode": "query_scoped_flat",
-        "subreddit_discovery_mode": "per_query_existing_behavior",
         "comment_enrichment": {
             "mode": "deferred_company_wide",
             "strategy": "deterministic_group_round_robin_preliminary_quality",
@@ -366,30 +384,26 @@ def build_execution_estimate(engine_plan: dict[str, Any], queries: list[dict[str
         subquery["sources"] for subquery in engine_plan["subqueries"] if subquery["label"] == query["label"]
     )]
     profile = engine_reddit.DEPTH_CONFIG[depth]
-    group_ids = list(dict.fromkeys(query["group_id"] for query in reddit_queries if query.get("group_id")))
-    group_mode = engine_plan.get("reddit_search_execution_mode") == "group_scoped_subreddit_expansion"
-    expansion_per_group = min(
-        int(engine_plan.get("reddit_max_discovered_subreddits_per_group") or 3),
-        int(engine_plan.get("reddit_max_subreddit_expansion_requests_per_group") or 3),
-    ) if group_mode else profile["subreddit_searches"]
-    base_global = len(reddit_queries) * profile["global_searches"]
-    expansion = len(group_ids) * expansion_per_group if group_mode else len(reddit_queries) * expansion_per_group
+    global_reddit_queries = [query for query in reddit_queries if not query.get("reddit_target_subreddits")]
+    targeted_reddit_queries = [query for query in reddit_queries if query.get("reddit_target_subreddits")]
+    group_ids = list(dict.fromkeys(query["group_id"] for query in global_reddit_queries if query.get("group_id")))
+    base_global = len(global_reddit_queries) * profile["global_searches"]
     return {
         "reddit_subquery_count": len(reddit_queries),
-        "scheduled_base_query_count": len(reddit_queries),
+        "scheduled_base_query_count": len(global_reddit_queries),
+        "preferred_subreddit_ticker_query_count": len(targeted_reddit_queries),
         "research_group_count": len(group_ids),
         "maximum_base_global_search_requests": base_global,
-        "maximum_subreddit_discovery_passes": len(group_ids) if group_mode else len(reddit_queries),
-        "maximum_subreddit_expansion_requests": expansion,
-        "maximum_primary_search_requests": base_global + expansion,
-        "maximum_public_fallback_search_invocations": len(reddit_queries) + expansion,
-        "maximum_fallback_search_invocations": len(reddit_queries) + expansion,
+        "maximum_subreddit_discovery_passes": 0,
+        "maximum_subreddit_expansion_requests": 0,
+        "maximum_primary_search_requests": base_global + len(targeted_reddit_queries),
+        "maximum_public_fallback_search_invocations": len(reddit_queries),
+        "maximum_fallback_search_invocations": len(reddit_queries),
         "comment_enrichment_is_company_wide": True,
         "source_fetch_cap": engine_pipeline.MAX_SOURCE_FETCHES.get("reddit"),
         "queries_expected_to_execute": [query["label"] for query in reddit_queries],
         "queries_expected_to_be_skipped": [],
         "submission_order": [query["label"] for query in reddit_queries],
-        "broad_discovery": True,
     }
 
 
@@ -421,7 +435,6 @@ def _write_metadata(plan: dict[str, Any], status: str, returncode: int | None, s
         "query_scheduler": plan["query_scheduler"],
         "execution_estimate": plan["execution_estimate"],
         "search_execution_mode": plan["search_execution_mode"],
-        "subreddit_discovery_mode": plan["subreddit_discovery_mode"],
         "comment_enrichment": plan["comment_enrichment"],
         "global_reddit_blocklist": plan["global_reddit_blocklist"],
         "global_reddit_preferences": plan["global_reddit_preferences"],
@@ -510,7 +523,10 @@ def main(argv: list[str] | None = None) -> int:
             summary_path.unlink(missing_ok=True)
         if returncode != 0 and summary_error is None:
             summary_error = "engine returned a non-zero exit code"
-        _write_metadata(plan, "completed" if returncode == 0 else "failed", returncode, statistics, summary_error)
+        _write_metadata(
+            plan, "completed" if returncode == 0 else "failed", returncode, statistics,
+            summary_error,
+        )
 
 
 if __name__ == "__main__":

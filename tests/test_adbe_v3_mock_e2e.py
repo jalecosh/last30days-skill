@@ -49,8 +49,8 @@ def test_adbe_grouped_mock_pipeline_keeps_all_base_queries_and_budgeted_unique_p
     group = report.artifacts["reddit_group_search"]
     enrichment = report.artifacts["reddit_comment_enrichment"]
     assert len(resolved["config"]["search_groups"]) == 5
-    assert len(submitted) == 26
-    assert group["subreddit_discovery_groups_processed"] == 5
+    assert len(submitted) == len(scheduled) == 39
+    assert "subreddit_discovery_groups_processed" not in group
     assert stats["provisional_reddit_records_before_deduplication"] > stats["provisional_unique_reddit_posts_after_deduplication"]
     assert enrichment["posts_selected_for_comment_enrichment"] <= 24
     assert stats["posts_pending_comment_enrichment"] == enrichment["posts_skipped_by_comment_tree_budget"]

@@ -45,11 +45,9 @@ def test_generic_finance_preference_multiplies_only_completed_reddit_score() -> 
     finance = _candidate("Finance")
     normal = _candidate("Autodesk")
     _, preferences = reddit_policy.load_preferences(PREFERENCES_PATH)
-    assert preferences == {
-        "finance": 1.5, "stocks": 1.5, "investing": 1.5,
-        "securityanalysis": 1.5, "valueinvesting": 1.5,
-    }
-    with patch.object(normalize, "SUBREDDIT_QUALITY_MULTIPLIERS", preferences), patch.object(
+    assert {"personalfinance", "trading", "dividends", "options", "daytrading", "bogleheads"} <= preferences
+    assert {"finance", "stocks", "investing", "securityanalysis", "valueinvesting"} <= preferences
+    with patch.object(normalize, "PREFERRED_SUBREDDITS", preferences), patch.object(
         rerank.signals, "reddit_rank_score", side_effect=[0.50, 0.90]
     ):
         assert rerank._final_score(finance) == 75.0
@@ -59,7 +57,7 @@ def test_generic_finance_preference_multiplies_only_completed_reddit_score() -> 
 def test_unknown_subreddit_keeps_multiplier_one_and_can_outrank_finance() -> None:
     finance = _candidate("investing")
     unknown = _candidate("product_support")
-    with patch.object(normalize, "SUBREDDIT_QUALITY_MULTIPLIERS", {"investing": 1.5}), patch.object(
+    with patch.object(normalize, "PREFERRED_SUBREDDITS", {"investing"}), patch.object(
         rerank.signals, "reddit_rank_score", side_effect=[0.50, 0.90]
     ):
         finance_score = rerank._final_score(finance)

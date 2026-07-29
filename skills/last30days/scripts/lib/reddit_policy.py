@@ -25,16 +25,26 @@ class Policy:
     blocked_subreddits: frozenset[str]
     preferences_version: int | None
     preferences_path: str | None
-    preferred_subreddits: dict[str, float]
+    preferred_subreddits: frozenset[str]
+
+
+def normalize_subreddit_name(value: object) -> str:
+    """Return a lowercase subreddit name, or empty for unusable provider data."""
+    try:
+        name = str(value or "").strip()
+    except Exception:
+        return ""
+    if name[:2].lower() == "r/":
+        name = name[2:].strip()
+    return name.lower() if SUBREDDIT_RE.fullmatch(name) else ""
 
 
 def normalize_subreddit(value: object) -> str:
-    name = str(value or "").strip()
-    if name[:2].lower() == "r/":
-        name = name[2:].strip()
-    if not SUBREDDIT_RE.fullmatch(name):
+    """Validate a configured subreddit name."""
+    name = normalize_subreddit_name(value)
+    if not name:
         raise ValueError(f"invalid subreddit name: {value!r}")
-    return name.lower()
+    return name
 
 
 def _read_object(path: Path) -> dict:
@@ -62,28 +72,23 @@ def load_blocklist(path: Path) -> tuple[int, frozenset[str]]:
     return data["version"], frozenset(normalized)
 
 
-def load_preferences(path: Path) -> tuple[int, dict[str, float]]:
+def load_preferences(path: Path) -> tuple[int, frozenset[str]]:
     data = _read_object(path)
     if set(data) != {"version", "preferred_subreddits"} or not isinstance(data["version"], int) or data["version"] < 1:
         raise ValueError(f"invalid preferences schema: {path}")
     values = data["preferred_subreddits"]
-    if not isinstance(values, dict):
-        raise ValueError(f"{path}: preferred_subreddits must be an object")
-    normalized: dict[str, float] = {}
-    for name, weight in values.items():
-        subreddit = normalize_subreddit(name)
-        if subreddit in normalized:
-            raise ValueError(f"{path}: preferred_subreddits contains duplicate names")
-        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0 < float(weight) <= 2:
-            raise ValueError(f"{path}: preference weight for {name!r} must be a number in (0, 2]")
-        normalized[subreddit] = float(weight)
-    return data["version"], normalized
+    if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+        raise ValueError(f"{path}: preferred_subreddits must be a list of strings")
+    normalized = [normalize_subreddit(name) for name in values]
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"{path}: preferred_subreddits contains duplicate names")
+    return data["version"], frozenset(normalized)
 
 
 def load_policy(blocklist_path: Path | None = None, preferences_path: Path | None = None) -> Policy:
     block_version, blocked = (None, frozenset()) if blocklist_path is None else load_blocklist(blocklist_path)
-    pref_version, preferred = (None, {}) if preferences_path is None else load_preferences(preferences_path)
-    if blocked & set(preferred):
+    pref_version, preferred = (None, frozenset()) if preferences_path is None else load_preferences(preferences_path)
+    if blocked & preferred:
         raise ValueError("a subreddit cannot be both blocked and preferred")
     return Policy(block_version, str(blocklist_path) if blocklist_path else None, blocked, pref_version, str(preferences_path) if preferences_path else None, preferred)
 

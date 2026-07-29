@@ -14,8 +14,8 @@ from . import dates, reddit_policy, schema
 _REDDIT_POLICY = reddit_policy.policy_from_environment()
 BLOCKED_SUBREDDITS = _REDDIT_POLICY.blocked_subreddits
 EXCLUDED_SUBREDDITS = BLOCKED_SUBREDDITS
-SUBREDDIT_QUALITY_MULTIPLIERS = _REDDIT_POLICY.preferred_subreddits
-DEFAULT_SUBREDDIT_QUALITY_MULTIPLIER = 1.00
+PREFERRED_SUBREDDITS = _REDDIT_POLICY.preferred_subreddits
+PREFERRED_SUBREDDIT_MULTIPLIER = 1.5
 COMMENT_NOT_ENRICHED = "not_enriched"
 COMMENT_ENRICHED_USABLE = "enriched_usable"
 COMMENT_ENRICHED_EMPTY = "enriched_empty"
@@ -33,7 +33,7 @@ def genuine_reddit_post_id(value: Any) -> str:
 
 def configure_reddit_policy(blocklist_path: str | None = None, preferences_path: str | None = None) -> None:
     """Reload policy for an embedding host or a focused unit test."""
-    global _REDDIT_POLICY, BLOCKED_SUBREDDITS, EXCLUDED_SUBREDDITS, SUBREDDIT_QUALITY_MULTIPLIERS
+    global _REDDIT_POLICY, BLOCKED_SUBREDDITS, EXCLUDED_SUBREDDITS, PREFERRED_SUBREDDITS
     from pathlib import Path
     _REDDIT_POLICY = reddit_policy.load_policy(
         Path(blocklist_path) if blocklist_path else None,
@@ -41,19 +41,16 @@ def configure_reddit_policy(blocklist_path: str | None = None, preferences_path:
     )
     BLOCKED_SUBREDDITS = _REDDIT_POLICY.blocked_subreddits
     EXCLUDED_SUBREDDITS = BLOCKED_SUBREDDITS
-    SUBREDDIT_QUALITY_MULTIPLIERS = _REDDIT_POLICY.preferred_subreddits
+    PREFERRED_SUBREDDITS = _REDDIT_POLICY.preferred_subreddits
 
-
-def _normalized_subreddit_name(value: object) -> str:
-    """Return a subreddit name suitable for case-insensitive policy checks."""
-    subreddit = str(value or "").strip()
-    if subreddit[:2].lower() == "r/":
-        subreddit = subreddit[2:].strip()
-    return subreddit.lower()
 
 
 def _is_excluded_reddit_subreddit(value: object) -> bool:
-    return _normalized_subreddit_name(value) in BLOCKED_SUBREDDITS
+    return reddit_policy.normalize_subreddit_name(value) in BLOCKED_SUBREDDITS
+
+
+def is_preferred_reddit_subreddit(value: object) -> bool:
+    return reddit_policy.normalize_subreddit_name(value) in PREFERRED_SUBREDDITS
 
 
 def reddit_subreddit_quality_multiplier(value: object) -> float:
@@ -62,12 +59,10 @@ def reddit_subreddit_quality_multiplier(value: object) -> float:
     Unknown communities deliberately receive the default 1.00 instead of being
     filtered or penalized, preserving topic-led global discovery.
     """
-    normalized = _normalized_subreddit_name(value)
+    normalized = reddit_policy.normalize_subreddit_name(value)
     if normalized in BLOCKED_SUBREDDITS:
         return 0.0
-    return SUBREDDIT_QUALITY_MULTIPLIERS.get(
-        normalized, DEFAULT_SUBREDDIT_QUALITY_MULTIPLIER
-    )
+    return PREFERRED_SUBREDDIT_MULTIPLIER if normalized in PREFERRED_SUBREDDITS else 1.0
 
 
 def filter_by_date_range(

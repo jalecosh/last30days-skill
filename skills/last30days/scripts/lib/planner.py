@@ -7,7 +7,7 @@ import re
 import unicodedata
 from collections import Counter
 
-from . import categories, entity_extract, http, providers, query, relevance, schema
+from . import categories, entity_extract, http, providers, query, reddit_policy, relevance, schema
 
 # Hebrew Unicode block: U+0590–U+05FF
 _HEBREW_RE = re.compile(r'[\u0590-\u05FF]')
@@ -58,8 +58,8 @@ def build_discovery_plan(
     seen_subreddits: set[str] = set()
     resolved_subreddits: list[str] = []
     for subreddit in candidate_subreddits:
-        normalized_subreddit = subreddit.removeprefix("r/").strip()
-        key = normalized_subreddit.lower()
+        normalized_subreddit = reddit_policy.normalize_subreddit_name(subreddit)
+        key = normalized_subreddit
         if not normalized_subreddit or key in seen_subreddits:
             continue
         seen_subreddits.add(key)
@@ -450,7 +450,8 @@ def _sanitize_plan(
         raw.get("preserve_all_subqueries") is True
         and raw.get("reddit_search_execution_mode") == "group_scoped_subreddit_expansion"
         and raw.get("reddit_comment_enrichment_mode") == "deferred_company_wide"
-        and 0 < len(raw_subqueries) <= int(raw.get("company_query_budget") or 0)
+        and int(raw.get("company_query_budget") or 0) > 0
+        and bool(raw_subqueries)
         and all(isinstance(entry, dict) and entry.get("group_id") and "reddit" in (entry.get("sources") or []) for entry in raw_subqueries)
     )
     if not preserve_all:
@@ -467,6 +468,15 @@ def _sanitize_plan(
         ranking_query = str(subquery.get("ranking_query") or "").strip()
         if not search_query or not ranking_query:
             continue
+        target_subreddits = subquery.get("reddit_target_subreddits", [])
+        if not isinstance(target_subreddits, list) or not all(isinstance(name, str) for name in target_subreddits):
+            continue
+        try:
+            target_subreddits = list(dict.fromkeys(
+                reddit_policy.normalize_subreddit(name) for name in target_subreddits
+            ))
+        except ValueError:
+            continue
         subqueries.append(
             schema.SubQuery(
                 label=str(subquery.get("label") or f"q{index}").strip() or f"q{index}",
@@ -475,6 +485,7 @@ def _sanitize_plan(
                 sources=sources,
                 weight=max(0.05, float(subquery.get("weight") or 1.0)),
                 group_id=(str(subquery.get("group_id")).strip() or None) if subquery.get("group_id") is not None else None,
+                reddit_target_subreddits=target_subreddits,
             )
         )
     if depth == "quick" and subqueries:
@@ -537,6 +548,7 @@ def _normalize_subquery_weights(subqueries: list[schema.SubQuery]) -> list[schem
             sources=subquery.sources,
             weight=subquery.weight / total,
             group_id=subquery.group_id,
+            reddit_target_subreddits=subquery.reddit_target_subreddits,
         )
         for subquery in subqueries
     ]

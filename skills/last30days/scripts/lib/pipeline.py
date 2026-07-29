@@ -53,6 +53,7 @@ from . import (
     reddit,
     reddit_keyless,
     reddit_listing,
+    reddit_policy,
     reddit_topic_eligibility,
     reddit_public,
     relevance,
@@ -829,7 +830,8 @@ def nominate_topic_pool(
     """Stage 1b of discovery: cluster nominated items into named candidate
     topics, rank them, and pair each with its source cluster id.
 
-    This is the shared core behind ``nominate_topics`` (the one-shot path,
+    This is the shared core behind `
+ominate_topics`` (the one-shot path,
     which drops the cluster ids) and the leg-1 nominate-only sweep (which
     keys nominations-bundle rows on them, see ``run_discover_nominate``).
 
@@ -926,7 +928,8 @@ def nominate_topics(
     to_date: str,
     limit: int,
 ) -> list[Nomination]:
-    """``nominate_topic_pool`` without the cluster ids: the one-shot
+    """`
+ominate_topic_pool`` without the cluster ids: the one-shot
     discovery path's contract (see that function for the full semantics)."""
     return [
         nomination
@@ -2513,7 +2516,7 @@ def run(
                 )
                 accepted_by_subreddit = reddit_recall["accepted_count_per_subreddit"]
                 for item in accepted:
-                    subreddit = normalize._normalized_subreddit_name(item.container) or "unknown"
+                    subreddit = reddit_policy.normalize_subreddit_name(item.container) or "unknown"
                     accepted_by_subreddit[subreddit] = accepted_by_subreddit.get(subreddit, 0) + 1
                 if rejected:
                     bundle.artifacts.setdefault("reddit_topic_gate_rejections", []).extend([
@@ -2566,23 +2569,23 @@ def run(
                 provisional_reddit_items.extend(expanded)
                 for key, value in counts.items():
                     search_counters[key] = search_counters.get(key, 0) + value
+        before = len(provisional_reddit_items)
         provisional_unique = merge_provisional_reddit_items(provisional_reddit_items)
+        unique_before_company_gate = len(provisional_unique)
         if plan.reddit_entity_terms:
             provisional_unique = [
                 item for item in provisional_unique
                 if matches_company_reddit_title(
-                    item.title,
-                    item.metadata.get("reddit_post_body"),
-                    plan.reddit_entity_terms,
-                    plan.raw_topic,
-                    item.container,
+                    item.title, item.body, plan.reddit_entity_terms,
+                    plan.raw_topic, item.container or "",
                 )
             ]
-        before = len(provisional_reddit_items)
         after = len(provisional_unique)
         run_statistics["provisional_reddit_records_before_deduplication"] = before
-        run_statistics["provisional_unique_reddit_posts_after_deduplication"] = after
-        run_statistics["provisional_duplicate_records_merged"] = before - after
+        run_statistics["provisional_unique_reddit_posts_after_deduplication"] = unique_before_company_gate
+        run_statistics["provisional_duplicate_records_merged"] = before - unique_before_company_gate
+        run_statistics["company_gate_accepted"] = after
+        run_statistics["company_gate_rejected"] = unique_before_company_gate - after
         run_statistics["posts_pending_comment_enrichment"] = after
         # Deliberately excluded from items_by_source and fusion until Phase 3C
         # validates comment evidence.  The artifact lets that phase reuse the
@@ -3171,8 +3174,8 @@ def company_title_eligibility_entities(entities: list[str], ticker: str) -> list
     ]
 
 
-def matches_company_entity(title: str, body: str, entities: list[str]) -> bool:
-    """Match a validated company entity in a Reddit title."""
+def _company_eligibility_entities(entities: list[str]) -> list[str]:
+    """Normalize the non-generic entity terms used by the title-only company gate."""
     normalized_entities = []
     for entity in entities:
         normalized = normalize_company_entity(entity)
@@ -3184,17 +3187,25 @@ def matches_company_entity(title: str, body: str, entities: list[str]) -> bool:
         if not any(re.search(r"(?<!\w)" + re.escape(candidate) + r"(?!\w)", entity)
                    for candidate in normalized_entities if candidate != entity)
     ]
-    title_text = " ".join(str(title or "").casefold().split())
-    for entity in normalized_entities:
-        pattern = r"(?<!\w)" + r"\s+".join(re.escape(token) for token in entity.split()) + r"(?!\w)"
-        if re.search(pattern, title_text):
-            return True
-    return False
+    return normalized_entities
 
 
-def is_finance_weighted_subreddit(subreddit: str) -> bool:
-    """Whether a subreddit has the configured finance/investment weight."""
-    return math.isclose(normalize.reddit_subreddit_quality_multiplier(subreddit), 1.5)
+def matched_company_entities(text: str, entities: list[str]) -> list[str]:
+    """Return validated entities that occur as exact phrases in supplied text."""
+    normalized_text = " ".join(str(text or "").casefold().split())
+    return [
+        entity for entity in _company_eligibility_entities(entities)
+        if re.search(
+            r"(?<!\w)" + r"\s+".join(re.escape(token) for token in entity.split()) + r"(?!\w)",
+            normalized_text,
+        )
+    ]
+
+
+def matches_company_entity(title: str, body: str, entities: list[str]) -> bool:
+    """Match a validated company entity in a Reddit title."""
+    # `body` remains intentionally ignored: company eligibility is title-only.
+    return bool(matched_company_entities(title, entities))
 
 
 def matches_exact_ticker_title(title: str, ticker: str) -> bool:
@@ -3211,9 +3222,9 @@ def matches_exact_ticker_title(title: str, ticker: str) -> bool:
 def matches_company_reddit_title(
     title: str, body: str, entities: list[str], ticker: str, subreddit: str,
 ) -> bool:
-    """Apply company title eligibility, with ticker support in weighted finance forums."""
+    """Apply company title eligibility, with ticker support in preferred forums."""
     return matches_company_entity(title, body, entities) or (
-        is_finance_weighted_subreddit(subreddit)
+        normalize.is_preferred_reddit_subreddit(subreddit)
         and matches_exact_ticker_title(title, ticker)
     )
 
@@ -3325,7 +3336,7 @@ def expand_group_reddit_subreddits(
     seen_subreddits: set[str] = set()
     subreddits = []
     for sub in discovered:
-        normalized_sub = normalize._normalized_subreddit_name(sub)
+        normalized_sub = reddit_policy.normalize_subreddit_name(sub)
         if normalized_sub and normalized_sub not in seen_subreddits and not normalize._is_excluded_reddit_subreddit(sub):
             seen_subreddits.add(normalized_sub)
             subreddits.append(str(sub))
@@ -4272,6 +4283,57 @@ def _retrieve_reddit_stream(
             "primary_search_failed": int(primary_failed), "public_fallback_invocations": public_fallbacks,
             "accepted_record_count": accepted,
         }}
+    target_subreddits = subquery.reddit_target_subreddits
+    if target_subreddits:
+        # This is intentionally a one-subquery/one-subreddit lane from the
+        # company plan.  It bypasses global search and never discovers or
+        # expands additional communities.
+        normalized_targets = {
+            reddit_policy.normalize_subreddit_name(subreddit)
+            for subreddit in target_subreddits
+            if reddit_policy.normalize_subreddit_name(subreddit)
+        }
+
+        def validate_targeted_items(items: list[dict]) -> list[dict]:
+            return [
+                item for item in items
+                if reddit_policy.normalize_subreddit_name(item.get("subreddit")) in normalized_targets
+            ]
+
+        primary_items: list[dict] = []
+        primary_failed = False
+        if has_sc_key:
+            try:
+                raw_primary_items = reddit.search_reddit_in_subreddits(
+                    reddit_query, target_subreddits, depth=depth,
+                    token=config.get("SCRAPECREATORS_API_KEY"),
+                )
+                primary_items = validate_targeted_items(raw_primary_items)
+            except Exception as exc:
+                primary_failed = True
+                sys.stderr.write(
+                    f"[Reddit] Targeted ScrapeCreators search failed "
+                    f"({type(exc).__name__}: {exc}), using public fallback\n"
+                )
+        if primary_items:
+            return primary_items, diagnostics(
+                "scrapecreators", primary_usable=True, accepted=len(primary_items),
+            )
+        try:
+            raw_public_items = reddit_keyless.search_public_in_subreddits(
+                reddit_query, target_subreddits, from_date=from_date,
+                to_date=to_date, depth=depth,
+            )
+            public_items = validate_targeted_items(raw_public_items)
+        except Exception as exc:
+            state = reddit.classify_run_failure(str(exc))
+            raise SourceRunError(f"Reddit targeted public search failed: {exc}", state) from exc
+        return public_items, diagnostics(
+            "scrapecreators" if has_sc_key else "public",
+            primary_empty=has_sc_key and not primary_failed,
+            primary_failed=primary_failed,
+            public_fallbacks=int(has_sc_key), accepted=len(public_items),
+        )
     sc_first = (
         has_sc_key
         and (config.get(env.REDDIT_BACKEND_PIN_VAR) or "").lower()
