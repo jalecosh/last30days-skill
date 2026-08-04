@@ -260,20 +260,42 @@ def test_adsk_uses_resolved_identity_in_generic_groups():
     assert all("d-wave" not in query["query"].casefold() for query in plan["queries"])
 
 
-def test_preferred_subreddit_lane_is_one_native_ticker_search_per_configured_subreddit():
-    plan = research_company.complete_plan(research_company.normalize_ticker("PTC"), _resolved("PTC"), date(2026, 7, 26), 30)
+@pytest.mark.parametrize(("ticker", "expected_query"), [
+    ("ADSK", 'ADSK OR "Autodesk"'),
+    ("SPGI", 'SPGI OR "S&P Global"'),
+])
+def test_preferred_subreddit_lane_uses_resolved_ticker_and_short_name(ticker, expected_query):
+    plan = research_company.complete_plan(research_company.normalize_ticker(ticker), _resolved(ticker), date(2026, 7, 26), 30)
     targeted = [query for query in plan["queries"] if query.get("reddit_target_subreddits")]
     preferred = plan["global_reddit_preferences"]["preferred_subreddits"]
     global_queries = [query for query in plan["queries"] if not query.get("reddit_target_subreddits")]
     assert len(global_queries) == 27
-    assert {"PTC stock", "PTC valuation", "PTC earnings", "PTC pricing power", "PTC switching costs", "PTC future growth"} <= {query["query"] for query in global_queries}
-    assert len(targeted) == len(preferred) == 12
-    assert len(plan["queries"]) == 39
-    assert [query["query"] for query in targeted] == ["PTC"] * len(preferred)
+    assert len(targeted) == len(preferred) == 9
+    assert len(plan["queries"]) == 36
+    assert [query["query"] for query in targeted] == [expected_query] * len(preferred)
     assert [query["reddit_target_subreddits"] for query in targeted] == [[subreddit] for subreddit in preferred]
     assert "stockmarket" in {subreddit for query in targeted for subreddit in query["reddit_target_subreddits"]}
     assert plan["execution_estimate"]["maximum_subreddit_discovery_passes"] == 0
     assert plan["execution_estimate"]["maximum_subreddit_expansion_requests"] == 0
+
+
+def test_preferred_subreddit_lane_avoids_duplicate_ticker_and_falls_back_without_short_name():
+    config = research_company._deep_merge(research_company._read_object(research_company.DEFAULTS_PATH), {
+        "company_name": "PTC Inc.",
+        "search_groups": research_company._generic_groups(research_company.CompanyIdentity("PTC", "PTC Inc.", "PTC")),
+    })
+    policy = research_company.reddit_policy.Policy(
+        None, None, frozenset(), 1, "fixture", frozenset({"stocks"}),
+    )
+    for identity, expected_query in (
+        (research_company.CompanyIdentity("PTC", "PTC Inc.", "  ptc  "), "PTC"),
+        (research_company.CompanyIdentity("EXMP", "Example Systems, Inc.", ""), "EXMP"),
+    ):
+        _engine_plan, queries, _scheduler = research_company.build_engine_plan({
+            "config": config, "identity": identity, "entities": [], "reddit_policy": policy,
+        })
+        targeted = [query for query in queries if query.get("reddit_target_subreddits")]
+        assert [query["query"] for query in targeted] == [expected_query]
 
 
 def test_missing_preference_policy_creates_no_targeted_subreddit_searches():
@@ -312,9 +334,9 @@ def test_external_company_plan_preserves_all_global_and_targeted_subqueries_thro
     sanitized = planner._sanitize_plan(engine_plan, "PTC", ["reddit"], ["reddit"], "default")
     global_subqueries = [query for query in sanitized.subqueries if not query.reddit_target_subreddits]
     targeted_subqueries = [query for query in sanitized.subqueries if query.reddit_target_subreddits]
-    assert len(queries) == len(sanitized.subqueries) == 39
+    assert len(queries) == len(sanitized.subqueries) == 36
     assert len(global_subqueries) == 27
-    assert len(targeted_subqueries) == 12
+    assert len(targeted_subqueries) == 9
     assert all(len(query.reddit_target_subreddits) == 1 for query in targeted_subqueries)
     assert {query.reddit_target_subreddits[0] for query in targeted_subqueries} == set(
         resolved["reddit_policy"].preferred_subreddits
@@ -339,7 +361,7 @@ def test_sanitizer_keeps_ordinary_external_plan_cap_and_rejects_malformed_compan
         "reddit_target_subreddits": ["not/a/subreddit"],
     })
     sanitized = planner._sanitize_plan(engine_plan, "PTC", ["reddit"], ["reddit"], "default")
-    assert len(sanitized.subqueries) == 39
+    assert len(sanitized.subqueries) == 36
     assert "bad-target" not in {query.label for query in sanitized.subqueries}
 
 
@@ -362,8 +384,8 @@ def test_sanitized_company_plan_reaches_all_targeted_native_reddit_branches():
             requested_sources=["reddit"], mock=True, external_plan=engine_plan,
         )
     targeted = [query for query in submitted if query.reddit_target_subreddits]
-    assert len(submitted) == 39
-    assert len(targeted) == 12
+    assert len(submitted) == 36
+    assert len(targeted) == 9
 
     with patch.object(pipeline.reddit, "search_reddit_in_subreddits", return_value=[]) as primary, \
          patch.object(pipeline.reddit_keyless, "search_public_in_subreddits", return_value=[]):
@@ -373,7 +395,7 @@ def test_sanitized_company_plan_reaches_all_targeted_native_reddit_branches():
                 config={"SCRAPECREATORS_API_KEY": "dummy"}, depth="default",
                 from_date="2026-07-01", to_date="2026-07-29", subreddits=None,
             )
-    assert primary.call_count == 12
+    assert primary.call_count == 9
     assert {call.args[1][0] for call in primary.call_args_list} == set(resolved["reddit_policy"].preferred_subreddits)
 
 
@@ -381,7 +403,7 @@ def test_execution_estimate_is_generic_and_deterministic():
     engine_plan = {"subqueries": [
         {"label": "group-a-1", "sources": ["reddit"]},
         {"label": "group-b-1", "sources": ["reddit"]},
-        {"label": "other-1", "sources": ["x"]},
+        {"label": "other-1", "sources": ["youtube"]},
     ]}
     queries = [
         {"label": "group-a-1", "group_id": "group-a", "query": "first"},

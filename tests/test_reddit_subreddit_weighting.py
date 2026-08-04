@@ -45,8 +45,10 @@ def test_generic_finance_preference_multiplies_only_completed_reddit_score() -> 
     finance = _candidate("Finance")
     normal = _candidate("Autodesk")
     _, preferences = reddit_policy.load_preferences(PREFERENCES_PATH)
-    assert {"personalfinance", "trading", "dividends", "options", "daytrading", "bogleheads"} <= preferences
-    assert {"finance", "stocks", "investing", "securityanalysis", "valueinvesting"} <= preferences
+    assert preferences == {
+        "finance", "stocks", "investing", "securityanalysis", "valueinvesting", "stockmarket",
+        "dividends", "options", "theraceto10million",
+    }
     with patch.object(normalize, "PREFERRED_SUBREDDITS", preferences), patch.object(
         rerank.signals, "reddit_rank_score", side_effect=[0.50, 0.90]
     ):

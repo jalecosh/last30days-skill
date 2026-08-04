@@ -288,11 +288,14 @@ def build_engine_plan(resolved: dict[str, Any]) -> tuple[dict[str, Any], list[di
     # unchanged and are never multiplied by these communities.
     policy = resolved.get("reddit_policy")
     preferred_subreddits = sorted(policy.preferred_subreddits) if policy else []
+    ticker = resolved["identity"].ticker
+    short_name = " ".join(resolved["identity"].short_name.split())
+    targeted_query = ticker if not short_name or short_name.casefold() == ticker.casefold() else f'{ticker} OR "{short_name}"'
     targeted_queries = [
         {
             "label": f"preferred-subreddit-{subreddit}",
             "group_id": "preferred_subreddit_ticker",
-            "query": resolved["identity"].ticker,
+            "query": targeted_query,
             "reddit_target_subreddits": [subreddit],
         }
         for subreddit in preferred_subreddits
